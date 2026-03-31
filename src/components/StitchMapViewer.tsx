@@ -37,8 +37,6 @@ const LABEL_ZOOM_THRESHOLD = 26
 const LABEL_DRAW_LIMIT = 3200
 const DRAG_THRESHOLD = 4
 const FIT_VERTICAL_BIAS = 0.18
-const ISOLATED_OUTLINE_FILL = 26
-const ISOLATED_THREAD_FILL = [18, 19, 22] as const
 const OUTLINE_SUPERSAMPLE = 2
 
 function clamp(value: number, min: number, max: number) {
@@ -162,7 +160,6 @@ export const StitchMapViewer = memo(function StitchMapViewer({
   const outlineCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const threadCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const isolationThreadCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const selectionMaskCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const boundaryMaskRef = useRef<Uint8Array | null>(null)
   const paletteColorsRef = useRef<ReadonlyArray<readonly [number, number, number]>>([])
   const [viewport, setViewport] = useState<ViewportSize>({ width: 0, height: 0 })
@@ -217,44 +214,6 @@ export const StitchMapViewer = memo(function StitchMapViewer({
   }, [stitchMap.height, stitchMap.width, viewport.height, viewport.width])
 
   useEffect(() => {
-    if (isolatedPaletteId === null) {
-      selectionMaskCanvasRef.current = null
-      return
-    }
-
-    const width = stitchMap.width
-    const height = stitchMap.height
-    const labels = stitchMap.labels
-    const maskCanvas = document.createElement('canvas')
-    const maskContext = maskCanvas.getContext('2d')
-
-    if (!maskContext) {
-      selectionMaskCanvasRef.current = null
-      return
-    }
-
-    maskCanvas.width = width
-    maskCanvas.height = height
-
-    const maskImage = maskContext.createImageData(width, height)
-
-    for (let index = 0; index < labels.length; index += 1) {
-      if (labels[index] !== isolatedPaletteId) {
-        continue
-      }
-
-      const dataOffset = index * 4
-      maskImage.data[dataOffset] = 255
-      maskImage.data[dataOffset + 1] = 255
-      maskImage.data[dataOffset + 2] = 255
-      maskImage.data[dataOffset + 3] = 255
-    }
-
-    maskContext.putImageData(maskImage, 0, 0)
-    selectionMaskCanvasRef.current = maskCanvas
-  }, [isolatedPaletteId, stitchMap.height, stitchMap.labels, stitchMap.width])
-
-  useEffect(() => {
     const width = stitchMap.width
     const height = stitchMap.height
     const pixelCount = width * height
@@ -297,32 +256,40 @@ export const StitchMapViewer = memo(function StitchMapViewer({
       const blockX = x * OUTLINE_SUPERSAMPLE
       const blockY = y * OUTLINE_SUPERSAMPLE
       const paletteIndex = labels[index] ?? 0
-      const isVisible = true
       const color =
         paletteColors[paletteIndex] ??
         ([255, 255, 255] as const)
+      const isolateExclude =
+        isolatedPaletteId !== null && paletteIndex !== isolatedPaletteId
 
       for (let dy = 0; dy < OUTLINE_SUPERSAMPLE; dy += 1) {
         for (let dx = 0; dx < OUTLINE_SUPERSAMPLE; dx += 1) {
           const hiIndex = (blockY + dy) * outlineWidth + (blockX + dx)
           const dataOffset = hiIndex * 4
-          outlineImage.data[dataOffset] = isVisible ? 255 : ISOLATED_OUTLINE_FILL
-          outlineImage.data[dataOffset + 1] = isVisible ? 255 : ISOLATED_OUTLINE_FILL
-          outlineImage.data[dataOffset + 2] = isVisible ? 255 : ISOLATED_OUTLINE_FILL
+          outlineImage.data[dataOffset] = 255
+          outlineImage.data[dataOffset + 1] = 255
+          outlineImage.data[dataOffset + 2] = 255
           outlineImage.data[dataOffset + 3] = 255
-          outlineColors[hiIndex] = isVisible ? 1 : 0
+          outlineColors[hiIndex] = 1
         }
       }
 
       const dataOffset = index * 4
-      threadImage.data[dataOffset] = isVisible ? color[0] : ISOLATED_THREAD_FILL[0]
-      threadImage.data[dataOffset + 1] = isVisible ? color[1] : ISOLATED_THREAD_FILL[1]
-      threadImage.data[dataOffset + 2] = isVisible ? color[2] : ISOLATED_THREAD_FILL[2]
+      threadImage.data[dataOffset] = color[0]
+      threadImage.data[dataOffset + 1] = color[1]
+      threadImage.data[dataOffset + 2] = color[2]
       threadImage.data[dataOffset + 3] = 255
-      isolationThreadImage.data[dataOffset] = threadImage.data[dataOffset]
-      isolationThreadImage.data[dataOffset + 1] = threadImage.data[dataOffset + 1]
-      isolationThreadImage.data[dataOffset + 2] = threadImage.data[dataOffset + 2]
-      isolationThreadImage.data[dataOffset + 3] = 255
+      if (isolateExclude) {
+        isolationThreadImage.data[dataOffset] = 0
+        isolationThreadImage.data[dataOffset + 1] = 0
+        isolationThreadImage.data[dataOffset + 2] = 0
+        isolationThreadImage.data[dataOffset + 3] = 0
+      } else {
+        isolationThreadImage.data[dataOffset] = color[0]
+        isolationThreadImage.data[dataOffset + 1] = color[1]
+        isolationThreadImage.data[dataOffset + 2] = color[2]
+        isolationThreadImage.data[dataOffset + 3] = 255
+      }
     }
 
     for (let y = 0; y < height; y += 1) {
@@ -391,6 +358,7 @@ export const StitchMapViewer = memo(function StitchMapViewer({
       isolationThreadImage.data[dataOffset] = 0
       isolationThreadImage.data[dataOffset + 1] = 0
       isolationThreadImage.data[dataOffset + 2] = 0
+      isolationThreadImage.data[dataOffset + 3] = 255
     }
 
     outlineSupersampledContext.putImageData(outlineImage, 0, 0)
@@ -403,7 +371,7 @@ export const StitchMapViewer = memo(function StitchMapViewer({
     outlineCanvasRef.current = outlineCanvas
     threadCanvasRef.current = threadCanvas
     isolationThreadCanvasRef.current = isolationThreadCanvas
-  }, [lineThickness, palette, showOutline, stitchMap])
+  }, [isolatedPaletteId, lineThickness, palette, showOutline, stitchMap])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -446,30 +414,19 @@ export const StitchMapViewer = memo(function StitchMapViewer({
     context.fillStyle = '#120d16'
     context.fillRect(0, 0, viewport.width, viewport.height)
 
-    const selectionMaskCanvas = selectionMaskCanvasRef.current
-
     context.save()
     context.imageSmoothingEnabled = false
     context.translate(view.offsetX, view.offsetY)
     context.scale(view.scale, view.scale)
-    const shouldIsolate = isolatedPaletteId !== null && selectionMaskCanvas
+    const shouldIsolate = isolatedPaletteId !== null
 
     if (shouldIsolate) {
       context.drawImage(isolatedBaseCanvas!, 0, 0)
+      context.drawImage(selectionCanvas, 0, 0)
     } else {
       context.drawImage(baseCanvas, 0, 0)
     }
     context.restore()
-
-    if (shouldIsolate) {
-      context.save()
-      context.translate(view.offsetX, view.offsetY)
-      context.scale(view.scale, view.scale)
-      context.drawImage(selectionCanvas, 0, 0)
-      context.globalCompositeOperation = 'destination-in'
-      context.drawImage(selectionMaskCanvas, 0, 0)
-      context.restore()
-    }
 
     const startX = clamp(Math.floor((-view.offsetX) / view.scale), 0, stitchMap.width)
     const endX = clamp(
