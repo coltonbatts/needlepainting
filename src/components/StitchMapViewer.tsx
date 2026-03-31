@@ -664,9 +664,9 @@ export const StitchMapViewer = memo(function StitchMapViewer({
   const gridVisible = showGrid && view.scale >= GRID_ZOOM_THRESHOLD
 
   return (
-    <div className="relative z-10 flex h-full min-h-0 w-full flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-[1.4rem] border border-white/10 bg-black/[0.22] px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2">
+    <div className="relative z-10 flex h-full min-h-0 w-full min-w-0 flex-col gap-2 sm:gap-3">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-[1.4rem] border border-white/10 bg-black/[0.22] px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
           <button
             type="button"
             onClick={() => handleZoomStep('out')}
@@ -725,7 +725,7 @@ export const StitchMapViewer = memo(function StitchMapViewer({
             </button>
           )}
         </div>
-        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] uppercase tracking-[0.2em] text-[var(--text-soft)]">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--text-soft)] sm:gap-2 sm:text-[11px] sm:tracking-[0.2em]">
           <span>{Math.round(view.scale * 100)}%</span>
           <span className="text-[var(--text-muted)]">/</span>
           <span>{labelsVisible ? 'numbers on' : 'hover to inspect'}</span>

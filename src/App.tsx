@@ -405,15 +405,15 @@ function App() {
   }, [])
 
   return (
-    <div className="flex min-h-screen flex-col bg-transparent text-[var(--text-main)]">
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-transparent text-[var(--text-main)]">
       <header className="shrink-0 border-b border-white/10 bg-black/20 backdrop-blur-2xl">
-        <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-5 px-4 py-5 lg:px-6 lg:py-6">
-          <div className="flex flex-col items-center gap-5">
-            <h1 className="magpie-display text-center text-4xl font-semibold tracking-[0.08em] text-[var(--text-strong)] sm:text-5xl">
+        <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-4 px-3 py-4 sm:gap-5 sm:px-4 sm:py-5 lg:px-6 lg:py-6">
+          <div className="flex flex-col items-center gap-4 sm:gap-5">
+            <h1 className="magpie-display text-center text-[clamp(1.65rem,4.2vw,3.15rem)] font-semibold leading-tight tracking-[0.06em] text-[var(--text-strong)] sm:tracking-[0.08em]">
               Magpie&apos;s Needle Painter
             </h1>
 
-            <div className="flex flex-wrap justify-center gap-3">
+            <div className="flex w-full max-w-full flex-wrap justify-center gap-2 sm:gap-3">
               <button
                 type="button"
                 onClick={handlePickFile}
@@ -496,9 +496,9 @@ function App() {
         </div>
       </header>
 
-      <main className="mx-auto flex min-h-0 w-full max-w-[1500px] flex-1 flex-col gap-5 overflow-hidden px-4 py-4 lg:flex-row lg:px-6 lg:py-5">
-        <section className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <div className="magpie-panel flex h-full flex-col overflow-hidden">
+      <main className="mx-auto flex min-h-0 w-full max-w-[1500px] min-w-0 flex-1 flex-col gap-4 overflow-hidden px-3 py-3 sm:gap-5 sm:px-4 sm:py-4 lg:flex-row lg:px-6 lg:py-5">
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="magpie-panel flex h-full min-h-0 flex-col overflow-hidden">
             <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 lg:flex-row lg:items-center lg:justify-between lg:px-6">
               <div>
                 <p className="magpie-label">{previewTitle}</p>
@@ -635,8 +635,8 @@ function App() {
           </div>
         </section>
 
-        <aside className="w-full shrink-0 lg:w-[20rem] xl:w-[21rem]">
-          <div className="magpie-panel flex h-full flex-col overflow-hidden">
+        <aside className="flex min-h-0 w-full max-w-full max-h-[min(46dvh,28rem)] shrink-0 flex-col overflow-hidden lg:max-h-none lg:w-[min(20rem,calc(100vw-3rem))] xl:w-[min(21rem,calc(100vw-3rem))]">
+          <div className="magpie-panel flex h-full min-h-0 flex-1 flex-col overflow-hidden">
             <div className="border-b border-white/10 px-5 py-4">
               <p className="magpie-label">Settings</p>
               <p className="mt-2 text-sm leading-6 text-[var(--text-soft)]">
@@ -794,7 +794,7 @@ function App() {
         </aside>
       </main>
 
-      <footer className="shrink-0 border-t border-white/10 bg-black/[0.18] px-6 py-3 backdrop-blur-2xl lg:px-8">
+      <footer className="shrink-0 border-t border-white/10 bg-black/[0.18] px-4 py-3 backdrop-blur-2xl sm:px-6 lg:px-8">
         <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-2 font-mono text-[10px] uppercase tracking-[0.22em] text-[var(--text-muted)] sm:flex-row sm:items-center sm:justify-between">
           <span>Magpie&apos;s Needle Painter</span>
           <span>{statusText}</span>

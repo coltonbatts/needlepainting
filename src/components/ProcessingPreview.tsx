@@ -36,7 +36,7 @@ export function ProcessingPreview({
         </>
       )}
 
-      <div className="relative flex h-full w-full flex-col justify-between gap-8 px-6 py-6 sm:px-8 sm:py-8 lg:px-10 lg:py-9">
+      <div className="relative flex h-full min-h-0 w-full min-w-0 flex-col justify-between gap-6 overflow-y-auto px-4 py-5 sm:gap-8 sm:px-8 sm:py-8 lg:px-10 lg:py-9">
         <div className="flex items-start justify-between gap-4">
           <div>
             <p className="magpie-label text-[var(--accent-soft)]">Processing</p>

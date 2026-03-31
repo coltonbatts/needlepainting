@@ -12,9 +12,13 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Magpie's Needle Painter",
         "width": 1280,
         "height": 800,
+        "minWidth": 880,
+        "minHeight": 620,
+        "center": true,
         "resizable": true
       }
     ],
