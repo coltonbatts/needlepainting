@@ -1,5 +1,11 @@
-use image::{GenericImageView, GrayImage, Rgba, RgbaImage};
+use image::{imageops::FilterType, GenericImageView, GrayImage, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
+use tauri::{Emitter, Window};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DMCColor {
@@ -30,9 +36,135 @@ pub struct PaletteEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ColoringBookResult {
-    pub image_data: Vec<u8>,          // PNG bytes
-    pub thread_preview_data: Vec<u8>, // PNG bytes
+    pub image_path: String,
+    pub thread_preview_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub labels: Vec<u8>,
     pub palette: Vec<PaletteEntry>,
+    pub metrics: RunMetrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageTimings {
+    pub load_ms: f64,
+    pub resize_ms: f64,
+    pub quantize_ms: f64,
+    pub flood_fill_ms: f64,
+    pub render_ms: f64,
+    pub png_encode_ms: f64,
+    pub total_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunMetrics {
+    pub preview: bool,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub working_width: u32,
+    pub working_height: u32,
+    pub num_colors: u8,
+    pub downscale_max: u32,
+    pub min_region_size: usize,
+    pub effective_min_region_size: usize,
+    pub line_thickness: u32,
+    pub timings: StageTimings,
+}
+
+#[derive(Clone, Copy)]
+enum ProgressStage {
+    LoadingImage,
+    ReducingColors,
+    CleaningRegions,
+    MatchingThreads,
+    BuildingOutlines,
+    PreparingPreview,
+    Complete,
+}
+
+impl ProgressStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadingImage => "loading_image",
+            Self::ReducingColors => "reducing_colors",
+            Self::CleaningRegions => "cleaning_regions",
+            Self::MatchingThreads => "matching_threads",
+            Self::BuildingOutlines => "building_outlines",
+            Self::PreparingPreview => "preparing_preview",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressPayload<'a> {
+    request_id: &'a str,
+    stage: &'static str,
+    label: &'a str,
+    stage_index: usize,
+    total_stages: usize,
+    progress: f32,
+}
+
+const TOTAL_PROGRESS_STAGES: usize = 6;
+const PREVIEW_ITERATIONS: usize = 8;
+const FINAL_ITERATIONS: usize = 20;
+const PREVIEW_SCALE_FACTOR: f64 = 0.65;
+
+fn temp_output_path(prefix: &str, request_id: &str, suffix: &str) -> Result<PathBuf, String> {
+    let mut dir = std::env::temp_dir();
+    dir.push("magpie-needle-painter");
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create temp output directory: {}", e))?;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let sanitized_request_id = request_id
+        .replace('/', "-")
+        .replace('\\', "-")
+        .replace(':', "-");
+    dir.push(format!("{prefix}-{sanitized_request_id}-{nanos}.{suffix}"));
+    Ok(dir)
+}
+
+fn write_png_to_temp(prefix: &str, request_id: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = temp_output_path(prefix, request_id, "png")?;
+    fs::write(&path, bytes)
+        .map_err(|e| format!("Failed to write PNG to temp file '{}': {}", path.display(), e))?;
+    Ok(path)
+}
+
+fn emit_progress(
+    window: &Window,
+    request_id: &str,
+    stage: ProgressStage,
+    stage_index: usize,
+    stage_progress: f32,
+    label: &str,
+) -> Result<(), String> {
+    let clamped_progress = stage_progress.clamp(0.0, 1.0);
+    let completed_stages = stage_index.saturating_sub(1) as f32;
+    let overall_progress = (completed_stages + clamped_progress) / TOTAL_PROGRESS_STAGES as f32;
+    let normalized_stage_index = stage_index.min(TOTAL_PROGRESS_STAGES);
+
+    window
+        .emit(
+            "pattern-progress",
+            ProgressPayload {
+                request_id,
+                stage: stage.as_str(),
+                label,
+                stage_index: normalized_stage_index,
+                total_stages: TOTAL_PROGRESS_STAGES,
+                progress: overall_progress.clamp(0.0, 1.0),
+            },
+        )
+        .map_err(|e| format!("Failed to emit progress update: {}", e))
 }
 
 // Load DMC data at compile time.
@@ -88,6 +220,7 @@ fn kmeans_quantize(
     pixels: &[(u8, u8, u8)],
     k: usize,
     iterations: usize,
+    mut on_iteration: impl FnMut(usize, usize),
 ) -> (Vec<(u8, u8, u8)>, Vec<u8>) {
     let n = pixels.len();
     if k < 1 || n == 0 {
@@ -104,7 +237,7 @@ fn kmeans_quantize(
 
     let mut labels = vec![0u8; n];
 
-    for _iter in 0..iterations {
+    for iter in 0..iterations {
         // Assign step
         for (i, &px) in pixels.iter().enumerate() {
             let mut best_label = 0u8;
@@ -139,6 +272,8 @@ fn kmeans_quantize(
                 );
             }
         }
+
+        on_iteration(iter + 1, iterations);
     }
 
     (centroids, labels)
@@ -424,47 +559,133 @@ fn render_thread_preview(
 /// Tauri command: load image -> quantize -> outline -> return PNG + DMC palette
 #[tauri::command]
 pub fn process_image(
+    window: Window,
     image_path: String,
+    request_id: String,
     num_colors: u8,
     line_thickness: u32,
     downscale_max: u32,
     min_region_size: usize,
+    preview: bool,
 ) -> Result<ColoringBookResult, String> {
-    // 1. Load image
-    let img = image::open(&image_path).map_err(|e| format!("Failed to load image: {}", e))?;
+    let total_start = Instant::now();
 
-    // 2. Scale down if needed for performance
-    let (ow, oh) = img.dimensions();
-    let max_dim = downscale_max.max(200);
-    let (w, h) = if ow > max_dim || oh > max_dim {
-        let s = max_dim as f64 / (ow.max(oh) as f64);
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::LoadingImage,
+        1,
+        0.05,
+        "Loading image",
+    )?;
+
+    let load_start = Instant::now();
+    let img = image::open(&image_path).map_err(|e| format!("Failed to load image: {}", e))?;
+    let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+    let (source_width, source_height) = img.dimensions();
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::LoadingImage,
+        1,
+        1.0,
+        "Loading image",
+    )?;
+
+    let resize_start = Instant::now();
+    let preview_max_dim = ((downscale_max as f64) * PREVIEW_SCALE_FACTOR).round() as u32;
+    let max_dim = if preview {
+        preview_max_dim.max(200)
+    } else {
+        downscale_max.max(200)
+    };
+    let (working_width, working_height) = if source_width > max_dim || source_height > max_dim {
+        let s = max_dim as f64 / (source_width.max(source_height) as f64);
         (
-            (ow as f64 * s).round() as u32,
-            (oh as f64 * s).round() as u32,
+            (source_width as f64 * s).round().max(1.0) as u32,
+            (source_height as f64 * s).round().max(1.0) as u32,
         )
     } else {
-        (ow, oh)
+        (source_width, source_height)
     };
-    let img = img.resize_exact(w, h, image::imageops::Lanczos3);
+    let filter = if preview {
+        FilterType::Triangle
+    } else {
+        FilterType::Lanczos3
+    };
+    let img = img.resize_exact(working_width, working_height, filter);
     let rgb = img.to_rgb8();
+    let resize_ms = resize_start.elapsed().as_secs_f64() * 1000.0;
 
-    // 3. Flatten pixels
     let pixels: Vec<(u8, u8, u8)> = rgb.pixels().map(|p| (p[0], p[1], p[2])).collect();
 
-    // 4. K-means quantize
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::ReducingColors,
+        2,
+        0.05,
+        "Reducing colors",
+    )?;
+    let quantize_start = Instant::now();
     let k = num_colors as usize;
-    let (centroids, labels) = kmeans_quantize(&pixels, k, 20);
+    let iterations = if preview {
+        PREVIEW_ITERATIONS
+    } else {
+        FINAL_ITERATIONS
+    };
+    let (centroids, labels) = kmeans_quantize(&pixels, k, iterations, |iteration, total_iterations| {
+        let stage_progress = iteration as f32 / total_iterations.max(1) as f32;
+        let _ = emit_progress(
+            &window,
+            &request_id,
+            ProgressStage::ReducingColors,
+            2,
+            stage_progress,
+            "Reducing colors",
+        );
+    });
 
     if centroids.is_empty() {
         return Err("Quantization produced no centroids".to_string());
     }
+    let quantize_ms = quantize_start.elapsed().as_secs_f64() * 1000.0;
 
-    // 5. Flood-fill regions, merge small ones
-    let merged_labels = flood_fill(w, h, &labels, min_region_size)?;
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::CleaningRegions,
+        3,
+        0.1,
+        "Cleaning regions",
+    )?;
+    let flood_fill_start = Instant::now();
+    let effective_min_region_size = if preview {
+        min_region_size.saturating_add(min_region_size / 2).max(8)
+    } else {
+        min_region_size
+    };
+    let merged_labels =
+        flood_fill(working_width, working_height, &labels, effective_min_region_size)?;
+    let flood_fill_ms = flood_fill_start.elapsed().as_secs_f64() * 1000.0;
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::CleaningRegions,
+        3,
+        1.0,
+        "Cleaning regions",
+    )?;
 
-    // 6. Compute palette + region counts
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::MatchingThreads,
+        4,
+        0.1,
+        "Matching threads",
+    )?;
     let mut palette = map_to_dmc(&centroids);
-    // Recount regions in merged labels
     let mut counts = vec![0usize; centroids.len()];
     for &lab in &merged_labels {
         if (lab as usize) < counts.len() {
@@ -474,12 +695,52 @@ pub fn process_image(
     for pe in &mut palette {
         pe.region_count = counts[pe.pal_id as usize];
     }
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::MatchingThreads,
+        4,
+        1.0,
+        "Matching threads",
+    )?;
 
-    // 7. Render both previews from the merged label map
-    let coloring_book = render_coloring_book(w, h, &merged_labels, line_thickness);
-    let thread_preview = render_thread_preview(w, h, &merged_labels, &palette, line_thickness);
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::BuildingOutlines,
+        5,
+        0.1,
+        "Building outlines",
+    )?;
+    let render_start = Instant::now();
+    let coloring_book =
+        render_coloring_book(working_width, working_height, &merged_labels, line_thickness);
+    let thread_preview = render_thread_preview(
+        working_width,
+        working_height,
+        &merged_labels,
+        &palette,
+        line_thickness,
+    );
+    let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::BuildingOutlines,
+        5,
+        1.0,
+        "Building outlines",
+    )?;
 
-    // 8. Encode to PNG
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::PreparingPreview,
+        6,
+        0.15,
+        "Preparing preview",
+    )?;
+    let png_encode_start = Instant::now();
     let mut png_bytes = Vec::new();
     coloring_book
         .write_to(
@@ -495,11 +756,80 @@ pub fn process_image(
             image::ImageFormat::Png,
         )
         .map_err(|e| format!("Thread preview PNG encode failed: {}", e))?;
+    let image_path = write_png_to_temp("outline", &request_id, &png_bytes)?;
+    let thread_preview_path = write_png_to_temp("thread", &request_id, &thread_preview_bytes)?;
+    let png_encode_ms = png_encode_start.elapsed().as_secs_f64() * 1000.0;
+
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::PreparingPreview,
+        6,
+        1.0,
+        "Preparing preview",
+    )?;
+    emit_progress(
+        &window,
+        &request_id,
+        ProgressStage::Complete,
+        6,
+        1.0,
+        "Pattern ready",
+    )?;
+
+    let timings = StageTimings {
+        load_ms,
+        resize_ms,
+        quantize_ms,
+        flood_fill_ms,
+        render_ms,
+        png_encode_ms,
+        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+    };
+    let metrics = RunMetrics {
+        preview,
+        source_width,
+        source_height,
+        working_width,
+        working_height,
+        num_colors,
+        downscale_max,
+        min_region_size,
+        effective_min_region_size,
+        line_thickness,
+        timings,
+    };
+
+    eprintln!(
+        "[magpie] run request_id={} mode={} source={}x{} working={}x{} colors={} downscale_max={} min_region_size={} effective_min_region_size={} line_thickness={} load={:.1}ms resize={:.1}ms quantize={:.1}ms flood_fill={:.1}ms render={:.1}ms png_encode={:.1}ms total={:.1}ms",
+        request_id,
+        if preview { "preview" } else { "final" },
+        source_width,
+        source_height,
+        working_width,
+        working_height,
+        num_colors,
+        downscale_max,
+        min_region_size,
+        effective_min_region_size,
+        line_thickness,
+        metrics.timings.load_ms,
+        metrics.timings.resize_ms,
+        metrics.timings.quantize_ms,
+        metrics.timings.flood_fill_ms,
+        metrics.timings.render_ms,
+        metrics.timings.png_encode_ms,
+        metrics.timings.total_ms,
+    );
 
     Ok(ColoringBookResult {
-        image_data: png_bytes,
-        thread_preview_data: thread_preview_bytes,
+        image_path: image_path.to_string_lossy().into_owned(),
+        thread_preview_path: thread_preview_path.to_string_lossy().into_owned(),
+        width: working_width,
+        height: working_height,
+        labels: merged_labels,
         palette,
+        metrics,
     })
 }
 

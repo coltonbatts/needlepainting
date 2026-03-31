@@ -1,17 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
-
-interface PaletteEntry {
-  pal_id: number
-  dmc_number: string
-  dmc_name: string
-  dmc_hex: string
-  centroid_r: number
-  centroid_g: number
-  centroid_b: number
-  region_count: number
-}
+import { ProcessingPreview } from './components/ProcessingPreview'
+import { StitchMapViewer } from './components/StitchMapViewer'
+import type {
+  ProcessMetrics,
+  PaletteEntry,
+  PreviewMode,
+  ProcessingProgressEvent,
+  ProcessingStageDefinition,
+  StitchMapData,
+} from './types'
 
 interface ResultState {
   sourceImageUrl: string
@@ -22,16 +22,22 @@ interface ResultState {
   palette: PaletteEntry[]
   filePath: string
   fileName: string
+  stitchMap: StitchMapData | null
+  metrics: ProcessMetrics | null
 }
 
 interface ProcessImageResponse {
-  image_data: number[]
-  thread_preview_data: number[]
+  image_path: string
+  thread_preview_path: string
+  width: number
+  height: number
+  labels: number[]
   palette: PaletteEntry[]
+  metrics: ProcessMetrics
 }
 
+type ProcessingMode = 'preview' | 'final'
 type PreviewImageResponse = number[]
-type PreviewMode = 'outline' | 'thread'
 
 interface SliderProps {
   label: string
@@ -43,7 +49,27 @@ interface SliderProps {
   hint: string
   minLabel: string
   maxLabel: string
+  disabled?: boolean
   onChange: (value: number) => void
+}
+
+const PROCESSING_STAGES: ProcessingStageDefinition[] = [
+  { key: 'loading_image', label: 'Loading image' },
+  { key: 'reducing_colors', label: 'Reducing colors' },
+  { key: 'cleaning_regions', label: 'Cleaning regions' },
+  { key: 'matching_threads', label: 'Matching threads' },
+  { key: 'building_outlines', label: 'Building outlines' },
+  { key: 'preparing_preview', label: 'Preparing preview' },
+]
+
+const PREVIEW_BUDGET_MS = 150
+
+function createProcessRequestId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+
+  return `pattern-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 
 function getFileName(filePath: string) {
@@ -63,6 +89,13 @@ function mimeTypeFromPath(filePath: string) {
   return 'application/octet-stream'
 }
 
+function clearTimer(ref: { current: ReturnType<typeof setTimeout> | null }) {
+  if (ref.current !== null) {
+    clearTimeout(ref.current)
+    ref.current = null
+  }
+}
+
 function revokeBlobUrl(ref: { current: string | null }) {
   if (ref.current) {
     URL.revokeObjectURL(ref.current)
@@ -80,13 +113,14 @@ function ControlSlider({
   hint,
   minLabel,
   maxLabel,
+  disabled = false,
   onChange,
 }: SliderProps) {
   return (
-    <div className="rounded-3xl border border-white/8 bg-black/20 p-4">
+    <div className="rounded-[1.7rem] border border-white/10 bg-black/[0.18] p-4 shadow-[0_16px_40px_rgba(12,7,18,0.16)]">
       <div className="mb-3 flex items-center justify-between gap-3">
         <label className="magpie-label">{label}</label>
-        <span className="font-mono text-sm text-stone-100">{valueLabel}</span>
+        <span className="font-mono text-sm text-[var(--text-strong)]">{valueLabel}</span>
       </div>
       <input
         type="range"
@@ -94,49 +128,238 @@ function ControlSlider({
         max={max}
         step={step}
         value={value}
+        disabled={disabled}
         onChange={(event) => onChange(Number(event.target.value))}
         className="magpie-range"
       />
-      <div className="mt-3 flex items-center justify-between font-mono text-[10px] uppercase tracking-[0.18em] text-stone-500">
+      <div className="mt-3 flex items-center justify-between font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
         <span>{minLabel}</span>
         <span>{maxLabel}</span>
       </div>
-      <p className="mt-2 text-sm leading-6 text-stone-400">{hint}</p>
+      <p className="mt-2 text-sm leading-6 text-[var(--text-soft)]">{hint}</p>
     </div>
   )
 }
 
 function App() {
   const [numColors, setNumColors] = useState(12)
-  const [lineThickness, setLineThickness] = useState(3)
+  const [lineThickness, setLineThickness] = useState(1)
   const [downscaleMax, setDownscaleMax] = useState(800)
   const [minRegionSize, setMinRegionSize] = useState(50)
   const [previewMode, setPreviewMode] = useState<PreviewMode>('outline')
   const [processing, setProcessing] = useState(false)
+  const [processingProgress, setProcessingProgress] = useState<ProcessingProgressEvent | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<ResultState | null>(null)
+  const [isolatedPaletteId, setIsolatedPaletteId] = useState<number | null>(null)
+  const activeRequestIdRef = useRef<string | null>(null)
   const sourceBlobUrlRef = useRef<string | null>(null)
-  const outlineBlobUrlRef = useRef<string | null>(null)
-  const threadPreviewBlobUrlRef = useRef<string | null>(null)
-  const hasPalette = Boolean(result && result.palette.length > 0)
-  const hasGeneratedPreview = Boolean(
-    result && result.outlineImageUrl && result.threadPreviewImageUrl && result.palette.length > 0,
+  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const finalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const previewSuppressedUntilRef = useRef<number>(0)
+  const lastScheduledSignatureRef = useRef<string | null>(null)
+  const isPatternReady = Boolean(
+    result &&
+      result.outlineImageUrl &&
+      result.threadPreviewImageUrl &&
+      result.palette.length > 0 &&
+      result.stitchMap,
   )
+  const hasPalette = Boolean(isPatternReady && result?.palette.length)
   const activePreviewUrl = result
-    ? hasGeneratedPreview
+    ? isPatternReady
       ? previewMode === 'thread'
         ? result.threadPreviewImageUrl
         : result.outlineImageUrl
       : result.sourceImageUrl
     : null
+  const currentStageLabel = processingProgress?.label ?? 'Processing'
+  const currentSettingsSignature = `${numColors}:${lineThickness}:${downscaleMax}:${minRegionSize}`
+  const previewTitle = processing
+    ? 'Processing'
+    : isPatternReady
+      ? previewMode === 'thread'
+        ? 'Thread Colors'
+        : 'Line Pattern'
+      : result
+        ? 'Photo'
+        : 'Preview'
+  const previewSubtitle = result
+    ? processing
+      ? `${result.fileName} · ${currentStageLabel}`
+      : result.fileName
+    : 'Choose a photo to begin.'
+  const statusText = processing
+    ? `${currentStageLabel}${processingProgress ? ` · ${Math.round(processingProgress.progress * 100)}%` : ''}`
+    : hasPalette
+      ? result?.metrics
+        ? `${result.metrics.preview ? 'Preview' : 'Final'} ready · ${Math.round(result.metrics.timings.totalMs)}ms`
+        : 'Pattern ready'
+      : result
+        ? 'Photo loaded'
+        : 'Ready'
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null
+
+    const attachListener = async () => {
+      unlisten = await listen<ProcessingProgressEvent>('pattern-progress', (event) => {
+        if (event.payload.requestId !== activeRequestIdRef.current) {
+          return
+        }
+
+        setProcessingProgress(event.payload)
+      })
+    }
+
+    void attachListener()
+
+    return () => {
+      if (unlisten) {
+        unlisten()
+      }
+    }
+  }, [])
+
+  const togglePaletteIsolation = useCallback((paletteId: number | null) => {
+    setIsolatedPaletteId((current) => (current === paletteId ? null : paletteId))
+  }, [])
+
+  const clearScheduledRuns = useCallback(() => {
+    clearTimer(previewTimerRef)
+    clearTimer(finalTimerRef)
+  }, [])
+
+  const startProcessing = useCallback(
+    async (mode: ProcessingMode) => {
+      if (!result?.filePath) return
+
+      const requestId = createProcessRequestId()
+      activeRequestIdRef.current = requestId
+      lastScheduledSignatureRef.current = currentSettingsSignature
+      setProcessing(true)
+      setError(null)
+      setProcessingProgress({
+        requestId,
+        stage: 'loading_image',
+        label: mode === 'preview' ? 'Building preview' : 'Loading image',
+        stageIndex: 1,
+        totalStages: PROCESSING_STAGES.length,
+        progress: 0,
+      })
+
+      try {
+        const res = (await invoke('process_image', {
+          imagePath: result.filePath,
+          requestId,
+          numColors,
+          lineThickness,
+          downscaleMax,
+          minRegionSize,
+          preview: mode === 'preview',
+        })) as ProcessImageResponse
+
+        if (activeRequestIdRef.current !== requestId) {
+          return
+        }
+
+        const outlineUrl = convertFileSrc(res.image_path)
+        const threadPreviewUrl = convertFileSrc(res.thread_preview_path)
+        setIsolatedPaletteId(null)
+
+        if (mode === 'preview') {
+          previewSuppressedUntilRef.current =
+            res.metrics.timings.totalMs > PREVIEW_BUDGET_MS
+              ? Date.now() + 2000
+              : 0
+        }
+
+        setResult((prev) =>
+          prev
+            ? {
+                ...prev,
+                outlineImageUrl: outlineUrl,
+                threadPreviewImageUrl: threadPreviewUrl,
+                width: res.width,
+                height: res.height,
+                palette: res.palette,
+                stitchMap: {
+                  width: res.width,
+                  height: res.height,
+                  labels: res.labels,
+                },
+                metrics: res.metrics,
+              }
+            : null,
+        )
+      } catch (e: unknown) {
+        if (activeRequestIdRef.current === requestId) {
+          const errMsg = e instanceof Error ? e.message : String(e)
+          setError(errMsg)
+        }
+      } finally {
+        if (activeRequestIdRef.current === requestId) {
+          activeRequestIdRef.current = null
+          setProcessing(false)
+        }
+      }
+    },
+    [currentSettingsSignature, downscaleMax, lineThickness, minRegionSize, numColors, result?.filePath],
+  )
 
   useEffect(() => {
     return () => {
       revokeBlobUrl(sourceBlobUrlRef)
-      revokeBlobUrl(outlineBlobUrlRef)
-      revokeBlobUrl(threadPreviewBlobUrlRef)
+      clearScheduledRuns()
     }
-  }, [])
+  }, [clearScheduledRuns])
+
+  useEffect(() => {
+    if (!result?.filePath || !result.metrics) {
+      return
+    }
+
+    const signature = currentSettingsSignature
+    if (signature === lastScheduledSignatureRef.current) {
+      return
+    }
+
+    clearScheduledRuns()
+
+    const settingsChangedOnlyThickness =
+      result.metrics.numColors === numColors &&
+      result.metrics.downscaleMax === downscaleMax &&
+      result.metrics.minRegionSize === minRegionSize &&
+      result.metrics.lineThickness !== lineThickness
+
+    const shouldRunPreview =
+      !settingsChangedOnlyThickness && Date.now() >= previewSuppressedUntilRef.current
+
+    if (shouldRunPreview) {
+      previewTimerRef.current = setTimeout(() => {
+        void startProcessing('preview')
+      }, 140)
+    }
+
+    finalTimerRef.current = setTimeout(
+      () => {
+        void startProcessing('final')
+      },
+      shouldRunPreview ? 700 : 320,
+    )
+
+    lastScheduledSignatureRef.current = signature
+  }, [
+    clearScheduledRuns,
+    currentSettingsSignature,
+    downscaleMax,
+    lineThickness,
+    minRegionSize,
+    numColors,
+    result?.filePath,
+    result?.metrics,
+    startProcessing,
+  ])
 
   const updateImageDimensions = useCallback((width: number, height: number) => {
     setResult((prev) => {
@@ -152,58 +375,16 @@ function App() {
   }, [])
 
   const handleProcess = useCallback(async () => {
-    if (!result?.filePath) return
-
-    setProcessing(true)
-    setError(null)
-
-    try {
-      const res = await invoke('process_image', {
-        imagePath: result.filePath,
-        numColors,
-        lineThickness,
-        downscaleMax,
-        minRegionSize,
-      }) as ProcessImageResponse
-
-      const outlineUrl = URL.createObjectURL(
-        new Blob([new Uint8Array(res.image_data)], { type: 'image/png' }),
-      )
-      const threadPreviewUrl = URL.createObjectURL(
-        new Blob([new Uint8Array(res.thread_preview_data)], { type: 'image/png' }),
-      )
-      revokeBlobUrl(outlineBlobUrlRef)
-      revokeBlobUrl(threadPreviewBlobUrlRef)
-      outlineBlobUrlRef.current = outlineUrl
-      threadPreviewBlobUrlRef.current = threadPreviewUrl
-      setPreviewMode('outline')
-
-      setResult((prev) =>
-        prev
-          ? {
-              ...prev,
-              outlineImageUrl: outlineUrl,
-              threadPreviewImageUrl: threadPreviewUrl,
-              width: 0,
-              height: 0,
-              palette: res.palette,
-            }
-          : null,
-      )
-    } catch (e: unknown) {
-      const errMsg = e instanceof Error ? e.message : String(e)
-      setError(errMsg)
-    } finally {
-      setProcessing(false)
-    }
-  }, [result?.filePath, numColors, lineThickness, downscaleMax, minRegionSize])
+    clearScheduledRuns()
+    await startProcessing('final')
+  }, [clearScheduledRuns, startProcessing])
 
   const handlePickFile = useCallback(async () => {
     setError(null)
 
     try {
       const selected = await dialogOpen({
-        title: 'Select an image to convert',
+        title: "Choose a photo for Magpie's Needle Painter",
         multiple: false,
         filters: [{
           name: 'Image',
@@ -212,19 +393,26 @@ function App() {
       })
 
       if (typeof selected === 'string') {
-        const previewBytes = await invoke('load_image_preview', {
+        activeRequestIdRef.current = null
+        clearScheduledRuns()
+        setProcessing(false)
+        setProcessingProgress(null)
+        setPreviewMode('outline')
+        setIsolatedPaletteId(null)
+        setError(null)
+        lastScheduledSignatureRef.current = null
+        previewSuppressedUntilRef.current = 0
+
+        const previewBytes = (await invoke('load_image_preview', {
           imagePath: selected,
-        }) as PreviewImageResponse
+        })) as PreviewImageResponse
         const previewUrl = URL.createObjectURL(
           new Blob([new Uint8Array(previewBytes)], {
             type: mimeTypeFromPath(selected),
           }),
         )
         revokeBlobUrl(sourceBlobUrlRef)
-        revokeBlobUrl(outlineBlobUrlRef)
-        revokeBlobUrl(threadPreviewBlobUrlRef)
         sourceBlobUrlRef.current = previewUrl
-        setPreviewMode('outline')
 
         setResult({
           sourceImageUrl: previewUrl,
@@ -235,60 +423,48 @@ function App() {
           palette: [],
           filePath: selected,
           fileName: getFileName(selected),
+          stitchMap: null,
+          metrics: null,
         })
       }
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : String(e)
-      setError(`Failed to open image: ${errMsg}`)
+      setError(`Could not open that photo: ${errMsg}`)
     }
-  }, [])
+  }, [clearScheduledRuns])
 
   return (
-    <div className="flex min-h-screen flex-col bg-transparent text-stone-100">
-      <header className="shrink-0 border-b border-white/10 bg-black/30 backdrop-blur-xl">
-        <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-4 px-6 py-5 lg:px-8">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="space-y-2">
-              <p className="font-mono text-[11px] uppercase tracking-[0.36em] text-amber-300/80">
-                Embroidery Needle Painting Studio
-              </p>
-              <div className="flex flex-wrap items-baseline gap-3">
-                <h1 className="font-['Avenir_Next'] text-3xl font-semibold tracking-[0.18em] text-white">
-                  MAGPIE
-                </h1>
-                <span className="rounded-full border border-amber-400/30 bg-amber-300/10 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.22em] text-amber-100">
-                  Outline + DMC Match
-                </span>
-              </div>
-              <p className="max-w-3xl text-sm leading-6 text-stone-400">
-                Convert a source image into a black-line coloring sheet, reduce noise,
-                and map every quantized tone to the nearest DMC floss.
-              </p>
-            </div>
+    <div className="flex min-h-screen flex-col bg-transparent text-[var(--text-main)]">
+      <header className="shrink-0 border-b border-white/10 bg-black/20 backdrop-blur-2xl">
+        <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-5 px-4 py-5 lg:px-6 lg:py-6">
+          <div className="flex flex-col items-center gap-5">
+            <h1 className="magpie-display text-center text-4xl font-semibold tracking-[0.08em] text-[var(--text-strong)] sm:text-5xl">
+              Magpie&apos;s Needle Painter
+            </h1>
 
-            <div className="flex flex-wrap gap-3">
+            <div className="flex flex-wrap justify-center gap-3">
               <button
                 onClick={handlePickFile}
-                className="magpie-button border-white/15 bg-white/[0.03] text-stone-100 hover:border-white/30 hover:bg-white/[0.09]"
+                className="magpie-button border-white/12 bg-white/[0.07] text-[var(--text-strong)] hover:border-white/25 hover:bg-white/12"
               >
-                Open Image
+                Choose Photo
               </button>
               <button
                 onClick={handleProcess}
                 disabled={!result?.filePath || processing}
-                className="magpie-button border-amber-300/40 bg-amber-300 text-black shadow-[0_0_30px_rgba(245,158,11,0.22)] hover:-translate-y-px hover:bg-amber-200"
+                className="magpie-button border-[var(--accent-strong)]/40 bg-[var(--accent-strong)] text-[#221622] shadow-[0_18px_40px_rgba(227,181,213,0.22)] hover:-translate-y-px hover:bg-[var(--accent-soft)]"
               >
-                {processing ? 'Generating' : 'Generate'}
+                {processing ? 'Making Pattern' : 'Make Pattern'}
               </button>
-              {hasPalette && result && (
+              {isPatternReady && result && !processing && (
                 <a
                   href={activePreviewUrl ?? result.outlineImageUrl ?? result.sourceImageUrl}
                   download={
                     previewMode === 'thread'
-                      ? `magpie-thread-preview-${numColors}-colors.png`
-                      : `magpie-coloring-book-${numColors}-colors.png`
+                      ? `magpies-needle-painter-thread-colors-${numColors}.png`
+                      : `magpies-needle-painter-line-pattern-${numColors}.png`
                   }
-                  className="magpie-button border-emerald-400/35 bg-emerald-400/10 text-emerald-100 hover:border-emerald-300/60 hover:bg-emerald-400/18"
+                  className="magpie-button border-[var(--accent-cool)]/40 bg-[var(--accent-cool)]/12 text-[var(--accent-cool-strong)] hover:border-[var(--accent-cool)]/70 hover:bg-[var(--accent-cool)]/20"
                 >
                   Save PNG
                 </a>
@@ -298,28 +474,18 @@ function App() {
         </div>
       </header>
 
-      <main className="mx-auto flex w-full max-w-[1800px] flex-1 flex-col gap-6 overflow-hidden px-6 py-6 lg:flex-row lg:px-8">
-        <section className="flex min-h-[420px] flex-1 flex-col overflow-hidden">
+      <main className="mx-auto flex min-h-0 w-full max-w-[1500px] flex-1 flex-col gap-5 overflow-hidden px-4 py-4 lg:flex-row lg:px-6 lg:py-5">
+        <section className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <div className="magpie-panel flex h-full flex-col overflow-hidden">
-            <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
+            <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 lg:flex-row lg:items-center lg:justify-between lg:px-6">
               <div>
-                <p className="magpie-label">
-                  {hasGeneratedPreview
-                    ? previewMode === 'thread'
-                      ? 'Thread-Color Preview'
-                      : 'Coloring Book Preview'
-                    : 'Source Preview'}
-                </p>
-                <p className="mt-1 text-sm text-stone-400">
-                  {result
-                    ? `${result.fileName}${hasGeneratedPreview ? ' processed for stitch planning' : ' ready for processing'}`
-                    : 'Load a source image to begin the conversion pipeline.'}
-                </p>
+                <p className="magpie-label">{previewTitle}</p>
+                <p className="mt-2 text-sm text-[var(--text-soft)]">{previewSubtitle}</p>
               </div>
-              <div className="flex items-center gap-3">
-                {hasGeneratedPreview && (
+              <div className="flex flex-wrap items-center gap-3">
+                {isPatternReady && !processing && (
                   <div
-                    className="inline-flex rounded-full border border-white/10 bg-black/25 p-1"
+                    className="inline-flex rounded-full border border-white/10 bg-black/[0.18] p-1"
                     aria-label="Preview mode"
                   >
                     <button
@@ -327,208 +493,260 @@ function App() {
                       aria-pressed={previewMode === 'outline'}
                       className={`magpie-toggle-segment ${
                         previewMode === 'outline'
-                          ? 'bg-amber-300 text-black shadow-[0_8px_24px_rgba(245,158,11,0.28)]'
-                          : 'text-stone-300 hover:bg-white/[0.06]'
+                          ? 'bg-[var(--accent-strong)] text-[#241625] shadow-[0_10px_28px_rgba(227,181,213,0.28)]'
+                          : 'text-[var(--text-soft)] hover:bg-white/10'
                       }`}
                       onClick={() => setPreviewMode('outline')}
                     >
-                      Outline
+                      Line
                     </button>
                     <button
                       type="button"
                       aria-pressed={previewMode === 'thread'}
                       className={`magpie-toggle-segment ${
                         previewMode === 'thread'
-                          ? 'bg-amber-300 text-black shadow-[0_8px_24px_rgba(245,158,11,0.28)]'
-                          : 'text-stone-300 hover:bg-white/[0.06]'
+                          ? 'bg-[var(--accent-strong)] text-[#241625] shadow-[0_10px_28px_rgba(227,181,213,0.28)]'
+                          : 'text-[var(--text-soft)] hover:bg-white/10'
                       }`}
                       onClick={() => setPreviewMode('thread')}
                     >
-                      Thread Colors
+                      Threads
                     </button>
                   </div>
                 )}
                 {result && (
-                  <div className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 font-mono text-[10px] uppercase tracking-[0.22em] text-stone-300">
+                  <div className="rounded-full border border-white/10 bg-white/[0.08] px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-[var(--text-soft)]">
                     {result.width} x {result.height}
                   </div>
                 )}
               </div>
             </div>
 
-            <div className="relative flex flex-1 items-center justify-center overflow-auto p-6">
-              <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.06),transparent_42%),linear-gradient(135deg,rgba(255,255,255,0.05)_0%,transparent_40%)]" />
+            <div className="relative flex min-h-0 flex-1 items-stretch justify-stretch overflow-hidden p-4 lg:p-5">
+              <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(232,189,223,0.12),transparent_38%),radial-gradient(circle_at_bottom_right,rgba(170,174,235,0.12),transparent_28%),linear-gradient(135deg,rgba(255,255,255,0.04)_0%,transparent_42%)]" />
 
               {error && (
-                <div className="relative z-10 max-w-xl rounded-3xl border border-rose-400/25 bg-rose-500/10 p-6 text-sm text-rose-100 shadow-[0_0_40px_rgba(244,63,94,0.12)]">
-                  <p className="magpie-label text-rose-200">Processing Error</p>
+                <div className="relative z-10 max-w-xl rounded-[1.8rem] border border-rose-300/30 bg-rose-300/10 p-6 text-sm text-rose-50 shadow-[0_18px_48px_rgba(115,37,77,0.16)]">
+                  <p className="magpie-label text-rose-100">Something Went Sideways</p>
                   <p className="mt-3 leading-7">{error}</p>
                 </div>
               )}
 
               {!result && !error && (
-                <div className="relative z-10 max-w-xl rounded-[2rem] border border-dashed border-white/15 bg-black/20 px-8 py-10 text-center">
-                  <p className="magpie-label text-amber-200">Awaiting Source Image</p>
-                  <h2 className="mt-4 text-3xl font-semibold text-white">
-                    Build a stitch-ready coloring book from any photo.
+                <div className="relative z-10 max-w-xl rounded-[2rem] border border-dashed border-white/15 bg-black/[0.18] px-8 py-10 text-center shadow-[0_20px_50px_rgba(10,6,16,0.18)]">
+                  <p className="magpie-label text-[var(--accent-soft)]">No Photo Yet</p>
+                  <h2 className="magpie-display mt-4 text-3xl font-semibold text-[var(--text-strong)]">
+                    Load a photo.
                   </h2>
-                  <p className="mt-4 text-base leading-7 text-stone-400">
-                    Open an image, tune the quantization controls, then generate a clean
-                    high-contrast outline with a matched DMC floss palette.
+                  <p className="mt-4 text-base leading-7 text-[var(--text-soft)]">
+                    Then generate the pattern.
                   </p>
                 </div>
               )}
 
               {result && activePreviewUrl && (
-                <div className="relative z-10 flex max-h-full w-full justify-center">
-                  <div className="rounded-[2rem] border border-white/10 bg-stone-950/90 p-4 shadow-[0_30px_80px_rgba(0,0,0,0.55)]">
-                    <img
-                      src={activePreviewUrl}
-                      alt={
-                        hasGeneratedPreview
-                          ? previewMode === 'thread'
-                            ? 'Generated thread color preview'
-                            : 'Generated coloring book output'
-                          : 'Selected source image'
-                      }
-                      className="max-h-[70vh] max-w-full rounded-[1.25rem] object-contain"
-                      style={{ imageRendering: hasGeneratedPreview ? 'pixelated' : 'auto' }}
-                      onLoad={(event) => {
-                        updateImageDimensions(
-                          event.currentTarget.naturalWidth,
-                          event.currentTarget.naturalHeight,
-                        )
-                      }}
-                      onError={() => {
-                        setError(
-                          hasGeneratedPreview
-                            ? previewMode === 'thread'
-                              ? 'Generated thread-color preview failed to load.'
-                              : 'Generated outline preview failed to load.'
-                            : 'Selected image preview failed to load.',
-                        )
-                      }}
-                    />
-                  </div>
+                <div className="relative z-10 flex h-full min-h-0 w-full">
+                  {isPatternReady && result.stitchMap ? (
+                    <>
+                      <StitchMapViewer
+                        stitchMap={result.stitchMap}
+                        palette={result.palette}
+                        previewMode={previewMode}
+                        lineThickness={lineThickness}
+                        isolatedPaletteId={isolatedPaletteId}
+                        onPaletteSelect={togglePaletteIsolation}
+                      />
+                      {processing && (
+                        <div className="pointer-events-none absolute right-4 top-4 z-20 rounded-full border border-white/10 bg-black/70 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.22em] text-[var(--text-soft)] shadow-[0_12px_30px_rgba(0,0,0,0.24)] backdrop-blur">
+                          {currentStageLabel}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {processing ? (
+                        <ProcessingPreview
+                          fileName={result.fileName}
+                          sourceImageUrl={result.sourceImageUrl}
+                          progress={processingProgress}
+                          stages={PROCESSING_STAGES}
+                        />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center rounded-[2rem] border border-white/10 bg-[#120d16]/88 p-4 shadow-[0_30px_80px_rgba(10,6,16,0.36)]">
+                          <img
+                            src={activePreviewUrl}
+                            alt="Selected source image"
+                            className="max-h-full max-w-full rounded-[1.4rem] object-contain shadow-[0_18px_50px_rgba(0,0,0,0.28)]"
+                            onLoad={(event) => {
+                              updateImageDimensions(
+                                event.currentTarget.naturalWidth,
+                                event.currentTarget.naturalHeight,
+                              )
+                            }}
+                            onError={() => {
+                              setError('That preview did not load cleanly.')
+                            }}
+                          />
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
             </div>
           </div>
         </section>
 
-        <aside className="w-full shrink-0 lg:w-[24rem]">
+        <aside className="w-full shrink-0 lg:w-[20rem] xl:w-[21rem]">
           <div className="magpie-panel flex h-full flex-col overflow-hidden">
             <div className="border-b border-white/10 px-5 py-4">
-              <p className="magpie-label">Processing Controls</p>
-              <p className="mt-2 text-sm leading-6 text-stone-400">
-                Balance color count, line weight, scaling, and noise cleanup before
-                generating the outline.
+              <p className="magpie-label">Settings</p>
+              <p className="mt-2 text-sm leading-6 text-[var(--text-soft)]">
+                Adjust thread count, outline weight, detail, and cleanup.
               </p>
             </div>
 
             <div className="flex-1 space-y-5 overflow-y-auto px-5 py-5">
               <ControlSlider
-                label="Colors"
+                label="Threads"
                 valueLabel={`${numColors}`}
                 value={numColors}
                 min={2}
                 max={32}
-                hint="Higher counts preserve tonal nuance; lower counts simplify the embroidery palette."
+                hint="More shades keep nuance. Fewer shades make it cleaner."
                 minLabel="2"
                 maxLabel="32"
                 onChange={setNumColors}
               />
 
               <ControlSlider
-                label="Line Thickness"
+                label="Outline"
                 valueLabel={`${lineThickness}px`}
                 value={lineThickness}
                 min={1}
                 max={10}
-                hint="Controls boundary weight in the generated coloring sheet."
+                hint="How bold the borders feel."
                 minLabel="1"
                 maxLabel="10"
                 onChange={setLineThickness}
               />
 
               <ControlSlider
-                label="Resolution"
+                label="Detail"
                 valueLabel={`${downscaleMax}px`}
                 value={downscaleMax}
                 min={200}
                 max={2400}
                 step={100}
-                hint="Larger values keep more detail but increase processing time."
+                hint="Higher keeps more of the original photo."
                 minLabel="200"
                 maxLabel="2400"
                 onChange={setDownscaleMax}
               />
 
               <ControlSlider
-                label="Min Region Size"
+                label="Speckle Cleanup"
                 valueLabel={minRegionSize === 0 ? 'Off' : `${minRegionSize}px`}
                 value={minRegionSize}
                 min={0}
                 max={500}
                 step={10}
-                hint="Merge isolated speckles into neighboring regions to keep the pattern readable."
+                hint="Softens tiny flecks into nearby color."
                 minLabel="0"
                 maxLabel="500"
                 onChange={setMinRegionSize}
               />
 
-              <div className="rounded-3xl border border-white/8 bg-black/20 p-4">
-                <p className="magpie-label">Loaded Image</p>
-                <div className="mt-3 space-y-2 text-sm text-stone-300">
-                  <p className="truncate text-stone-100">
-                    {result ? result.fileName : 'No file selected'}
+              <div className="rounded-[1.7rem] border border-white/10 bg-black/[0.18] p-4 shadow-[0_16px_40px_rgba(12,7,18,0.16)]">
+                <p className="magpie-label">Photo</p>
+                <div className="mt-3 space-y-2 text-sm text-[var(--text-soft)]">
+                  <p className="truncate text-[var(--text-strong)]">
+                    {result ? result.fileName : 'Nothing chosen yet'}
                   </p>
-                  <p className="text-stone-500">
+                  <p className="text-[var(--text-muted)]">
                     {result
-                      ? `Current preview: ${result.width} x ${result.height}${hasGeneratedPreview ? ` · ${previewMode === 'thread' ? 'thread colors' : 'outline'}` : ''}`
-                      : 'Open an image to populate the preview and enable generation.'}
+                      ? `${result.width} x ${result.height}${processing ? ' · processing' : isPatternReady ? ` · ${previewMode === 'thread' ? 'thread colors' : 'line pattern'}` : ''}`
+                      : 'Choose a photo to load it here.'}
                   </p>
+                  {result?.metrics && (
+                    <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      {result.metrics.preview ? 'preview' : 'final'} · {Math.round(result.metrics.timings.totalMs)}
+                      ms · {result.metrics.workingWidth} x {result.metrics.workingHeight} ·{' '}
+                      {result.metrics.numColors} colors · {result.metrics.downscaleMax}px · min region{' '}
+                      {result.metrics.minRegionSize}px
+                    </p>
+                  )}
                 </div>
               </div>
 
-              <div className="rounded-3xl border border-white/8 bg-black/20 p-4">
+              <div className="rounded-[1.7rem] border border-white/10 bg-black/[0.18] p-4 shadow-[0_16px_40px_rgba(12,7,18,0.16)]">
                 <div className="flex items-center justify-between gap-3">
-                  <p className="magpie-label">DMC Palette</p>
-                  <span className="font-mono text-xs text-stone-500">
-                    {hasPalette ? `${result?.palette.length} colors` : 'Pending'}
-                  </span>
+                  <p className="magpie-label">Threads</p>
+                  <div className="flex items-center gap-2">
+                    {isolatedPaletteId !== null && (
+                      <button
+                        type="button"
+                        onClick={() => setIsolatedPaletteId(null)}
+                        disabled={processing}
+                        className="magpie-button border-white/10 bg-white/[0.08] px-3 py-1.5 text-[10px] text-[var(--text-strong)] hover:border-white/25 hover:bg-white/12"
+                      >
+                        Show All
+                      </button>
+                    )}
+                    <span className="font-mono text-xs text-[var(--text-muted)]">
+                      {processing ? currentStageLabel : hasPalette ? `${result?.palette.length} shades` : 'Waiting'}
+                    </span>
+                  </div>
                 </div>
 
-                {!hasPalette && (
-                  <p className="mt-3 text-sm leading-6 text-stone-400">
-                    Generate the coloring book to see the matched floss palette and
-                    region coverage data.
+                {processing && (
+                  <p className="mt-3 text-sm leading-6 text-[var(--text-soft)]">
+                    Thread details appear after the new pattern is ready.
                   </p>
                 )}
 
-                {hasPalette && result && (
+                {!processing && !hasPalette && (
+                  <p className="mt-3 text-sm leading-6 text-[var(--text-soft)]">
+                    Generate a pattern to see the thread list.
+                  </p>
+                )}
+
+                {!processing && hasPalette && result && (
                   <div className="mt-4 space-y-2">
+                    <p className="text-xs leading-5 text-[var(--text-muted)]">
+                      Select a thread to isolate it in the pattern view.
+                    </p>
                     {result.palette.map((entry) => (
-                      <div
+                      <button
+                        type="button"
                         key={entry.pal_id}
-                        className="flex items-center gap-3 rounded-2xl border border-white/6 bg-white/[0.03] px-3 py-2"
+                        onClick={() => togglePaletteIsolation(entry.pal_id)}
+                        className={`flex w-full items-center gap-3 rounded-[1.25rem] border px-3 py-2 text-left transition duration-200 ${
+                          isolatedPaletteId === entry.pal_id
+                            ? 'border-[var(--accent-strong)]/45 bg-[var(--accent-strong)]/14 shadow-[0_14px_30px_rgba(214,166,201,0.14)]'
+                            : 'border-white/8 bg-white/[0.06] hover:border-white/18 hover:bg-white/10'
+                        }`}
+                        aria-pressed={isolatedPaletteId === entry.pal_id}
                       >
-                        <span className="w-7 shrink-0 text-right font-mono text-[10px] uppercase tracking-[0.18em] text-stone-500">
+                        <span className="w-7 shrink-0 text-right font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
                           {entry.pal_id}
                         </span>
                         <div
-                          className="h-10 w-10 shrink-0 rounded-xl border border-black/30 shadow-inner"
+                          className="h-10 w-10 shrink-0 rounded-[0.95rem] border border-black/20 shadow-inner"
                           style={{ backgroundColor: entry.dmc_hex }}
                         />
                         <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm text-stone-100">
+                          <p className="truncate text-sm text-[var(--text-strong)]">
                             {entry.dmc_number} {entry.dmc_name}
                           </p>
-                          <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.18em] text-stone-500">
-                            {entry.dmc_hex} · {entry.region_count} px
+                          <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                            {entry.dmc_hex} · {entry.region_count} cells
                           </p>
                         </div>
-                      </div>
+                        <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                          {isolatedPaletteId === entry.pal_id ? 'selected' : 'isolate'}
+                        </span>
+                      </button>
                     ))}
                   </div>
                 )}
@@ -538,18 +756,10 @@ function App() {
         </aside>
       </main>
 
-      <footer className="shrink-0 border-t border-white/10 bg-black/25 px-6 py-3 backdrop-blur-xl lg:px-8">
-        <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-2 font-mono text-[10px] uppercase tracking-[0.22em] text-stone-500 sm:flex-row sm:items-center sm:justify-between">
-          <span>Magpie v0.1.0</span>
-          <span>
-            {processing
-              ? 'Processing image'
-              : hasPalette
-                ? 'Outline and palette ready'
-                : result
-                  ? 'Source image loaded'
-                  : 'Ready'}
-          </span>
+      <footer className="shrink-0 border-t border-white/10 bg-black/[0.18] px-6 py-3 backdrop-blur-2xl lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-2 font-mono text-[10px] uppercase tracking-[0.22em] text-[var(--text-muted)] sm:flex-row sm:items-center sm:justify-between">
+          <span>Magpie&apos;s Needle Painter</span>
+          <span>{statusText}</span>
         </div>
       </footer>
     </div>

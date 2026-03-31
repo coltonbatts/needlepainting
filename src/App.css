@@ -5,13 +5,28 @@
 @layer base {
   :root {
     color-scheme: dark;
-    font-family: "Avenir Next", "Segoe UI", sans-serif;
+    font-family: "Avenir Next", "Nunito Sans", "Segoe UI", sans-serif;
     font-synthesis: none;
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    background-color: #050505;
-    color: #f5f5f4;
+    background-color: #050506;
+    color: #f3eef4;
+
+    --bg-deep: #050506;
+    --bg-mid: #0c0a0f;
+    --bg-surface: rgba(11, 10, 14, 0.9);
+    --bg-surface-strong: rgba(8, 7, 10, 0.96);
+    --text-strong: #fff8fd;
+    --text-main: #f0e9ef;
+    --text-soft: #cdbecb;
+    --text-muted: #857581;
+    --accent-strong: #d6a6c9;
+    --accent-soft: #ebc1dd;
+    --accent-cool: #a6accf;
+    --accent-cool-strong: #d7ddff;
+    --line-soft: rgba(255, 255, 255, 0.1);
+    --ring: rgba(245, 199, 230, 0.78);
   }
 
   * {
@@ -27,9 +42,23 @@
 
   body {
     background:
-      radial-gradient(circle at top left, rgba(245, 158, 11, 0.14), transparent 24rem),
-      radial-gradient(circle at top right, rgba(56, 189, 248, 0.09), transparent 18rem),
-      linear-gradient(180deg, #111111 0%, #09090b 58%, #050505 100%);
+      radial-gradient(circle at top left, rgba(111, 58, 90, 0.16), transparent 18rem),
+      radial-gradient(circle at top right, rgba(88, 82, 128, 0.12), transparent 16rem),
+      radial-gradient(circle at bottom, rgba(54, 34, 58, 0.16), transparent 22rem),
+      linear-gradient(180deg, #0c0b0e 0%, #070709 52%, #040405 100%);
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.12;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 32px 32px;
+    mask-image: radial-gradient(circle at center, black 42%, transparent 100%);
   }
 
   button,
@@ -39,68 +68,176 @@
   }
 
   ::selection {
-    background: rgba(245, 158, 11, 0.9);
-    color: #111827;
+    background: rgba(245, 199, 230, 0.92);
+    color: #261827;
   }
 }
 
 @layer components {
   .magpie-panel {
-    @apply rounded-[1.75rem] border border-white/10 bg-white/[0.04] shadow-[0_28px_100px_rgba(0,0,0,0.45)] backdrop-blur-sm;
+    @apply rounded-[2rem] border shadow-[0_28px_90px_rgba(10,6,16,0.34)] backdrop-blur-md;
+    border-color: var(--line-soft);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015)),
+      var(--bg-surface);
   }
 
   .magpie-label {
-    @apply font-mono text-[11px] uppercase tracking-[0.24em] text-stone-400;
+    @apply font-mono text-[11px] uppercase tracking-[0.24em];
+    color: var(--text-muted);
+  }
+
+  .magpie-display {
+    font-family: "Didot", "Bodoni MT", "Times New Roman", serif;
   }
 
   .magpie-button {
-    @apply inline-flex items-center justify-center rounded-full border px-4 py-2.5 font-mono text-[11px] uppercase tracking-[0.22em] transition duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300/80 focus-visible:ring-offset-2 focus-visible:ring-offset-black disabled:cursor-not-allowed disabled:opacity-40;
+    @apply inline-flex items-center justify-center rounded-full border px-4 py-2.5 font-mono text-[11px] uppercase tracking-[0.2em] transition duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-40;
+    border-color: var(--line-soft);
+    color: var(--text-main);
+    background-color: rgba(255, 255, 255, 0.03);
+    box-shadow: 0 0 0 rgba(0, 0, 0, 0);
+  }
+
+  .magpie-button:focus-visible,
+  .magpie-toggle-segment:focus-visible,
+  .magpie-viewer-button:focus-visible,
+  .magpie-viewer-chip:focus-visible {
+    outline: none;
+    --tw-ring-color: var(--ring);
+    --tw-ring-offset-color: #120d16;
+    box-shadow: 0 0 0 2px var(--ring);
   }
 
   .magpie-toggle-segment {
-    @apply inline-flex items-center justify-center rounded-full px-3 py-2 font-mono text-[10px] uppercase tracking-[0.2em] transition duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300/80 focus-visible:ring-offset-2 focus-visible:ring-offset-black;
+    @apply inline-flex items-center justify-center rounded-full px-3 py-2 font-mono text-[10px] uppercase tracking-[0.2em] transition duration-200;
   }
 
   .magpie-range {
     @apply w-full appearance-none bg-transparent;
   }
+
+  .magpie-viewer-button {
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-full border text-lg font-semibold transition duration-200;
+    border-color: var(--line-soft);
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-strong);
+  }
+
+  .magpie-viewer-button:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+
+  .magpie-viewer-chip {
+    @apply inline-flex items-center justify-center rounded-full border px-3 py-2 font-mono text-[10px] uppercase tracking-[0.18em] transition duration-200;
+    border-color: var(--line-soft);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-soft);
+  }
+
+  .magpie-viewer-chip:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+
+  .magpie-viewer-chip-active {
+    background: rgba(227, 181, 213, 0.18);
+    border-color: rgba(227, 181, 213, 0.42);
+    color: var(--text-strong);
+  }
 }
 
 .magpie-range::-webkit-slider-runnable-track {
-  height: 0.45rem;
+  height: 0.5rem;
   border-radius: 9999px;
-  background: linear-gradient(90deg, rgba(245, 158, 11, 0.88), rgba(255, 255, 255, 0.28));
+  background: linear-gradient(90deg, rgba(245, 199, 230, 0.92), rgba(184, 190, 223, 0.45));
 }
 
 .magpie-range::-webkit-slider-thumb {
   -webkit-appearance: none;
-  margin-top: -0.33rem;
-  height: 1.1rem;
-  width: 1.1rem;
+  margin-top: -0.35rem;
+  height: 1.2rem;
+  width: 1.2rem;
   border-radius: 9999px;
-  border: 2px solid rgba(255, 255, 255, 0.85);
-  background: #09090b;
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+  border: 2px solid rgba(255, 244, 251, 0.9);
+  background: #221723;
+  box-shadow: 0 0 0 4px rgba(227, 181, 213, 0.18);
 }
 
 .magpie-range::-moz-range-track {
-  height: 0.45rem;
+  height: 0.5rem;
   border-radius: 9999px;
-  background: linear-gradient(90deg, rgba(245, 158, 11, 0.88), rgba(255, 255, 255, 0.28));
+  background: linear-gradient(90deg, rgba(245, 199, 230, 0.92), rgba(184, 190, 223, 0.45));
 }
 
 .magpie-range::-moz-range-thumb {
-  height: 1.1rem;
-  width: 1.1rem;
+  height: 1.2rem;
+  width: 1.2rem;
   border-radius: 9999px;
-  border: 2px solid rgba(255, 255, 255, 0.85);
-  background: #09090b;
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+  border: 2px solid rgba(255, 244, 251, 0.9);
+  background: #221723;
+  box-shadow: 0 0 0 4px rgba(227, 181, 213, 0.18);
+}
+
+.magpie-range:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.magpie-processing-spinner {
+  position: relative;
+  overflow: hidden;
+}
+
+.magpie-processing-spinner::before,
+.magpie-processing-spinner::after {
+  content: "";
+  position: absolute;
+  inset: 0.5rem;
+  border-radius: 9999px;
+}
+
+.magpie-processing-spinner::before {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.magpie-processing-spinner::after {
+  border: 2px solid transparent;
+  border-top-color: rgba(235, 193, 221, 0.92);
+  border-right-color: rgba(166, 172, 207, 0.62);
+  animation: magpie-spin 1.15s linear infinite;
+}
+
+.magpie-processing-bar {
+  background: linear-gradient(90deg, rgba(235, 193, 221, 0.96), rgba(166, 172, 207, 0.85));
+  box-shadow: 0 0 24px rgba(235, 193, 221, 0.22);
+  transition: width 220ms ease;
+}
+
+@keyframes magpie-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .magpie-processing-spinner::after {
+    animation: none;
+  }
+
+  .magpie-processing-bar {
+    transition: none;
+  }
 }
 
 ::-webkit-scrollbar {
-  width: 0.7rem;
-  height: 0.7rem;
+  width: 0.72rem;
+  height: 0.72rem;
 }
 
 ::-webkit-scrollbar-track {
@@ -110,6 +247,6 @@
 ::-webkit-scrollbar-thumb {
   border-radius: 9999px;
   border: 2px solid transparent;
-  background: rgba(255, 255, 255, 0.18);
+  background: rgba(235, 201, 226, 0.3);
   background-clip: padding-box;
 }
