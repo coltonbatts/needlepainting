@@ -41,6 +41,9 @@ export interface ProcessMetrics {
 
 export type PreviewMode = 'outline' | 'thread'
 
+/** PNG export: line art only, or thread fills with/without black boundary lines. */
+export type PngExportVariant = 'line' | 'thread_outline' | 'thread_fill'
+
 export type ProcessingStage =
   | 'loading_image'
   | 'reducing_colors'

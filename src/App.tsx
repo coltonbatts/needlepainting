@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
@@ -7,11 +7,14 @@ import { StitchMapViewer } from './components/StitchMapViewer'
 import type {
   ProcessMetrics,
   PaletteEntry,
+  PngExportVariant,
   PreviewMode,
   ProcessingProgressEvent,
   ProcessingStageDefinition,
   StitchMapData,
 } from './types'
+import { buildPatternExportBlob, pngExportFilename } from './utils/stitchExport'
+import { validateStitchMapLabelLength } from './utils/stitchMapValidation'
 
 interface ResultState {
   sourceImageUrl: string
@@ -85,13 +88,17 @@ function ControlSlider({
   disabled = false,
   onChange,
 }: SliderProps) {
+  const rangeId = useId()
   return (
     <div className="rounded-[1.7rem] border border-white/10 bg-black/[0.18] p-4 shadow-[0_16px_40px_rgba(12,7,18,0.16)]">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <label className="magpie-label">{label}</label>
+        <label htmlFor={rangeId} className="magpie-label">
+          {label}
+        </label>
         <span className="font-mono text-sm text-[var(--text-strong)]">{valueLabel}</span>
       </div>
       <input
+        id={rangeId}
         type="range"
         min={min}
         max={max}
@@ -119,6 +126,8 @@ function App() {
   const [showOutline, setShowOutline] = useState(true)
   const [processing, setProcessing] = useState(false)
   const [savingPng, setSavingPng] = useState(false)
+  const [pngExportVariant, setPngExportVariant] = useState<PngExportVariant>('thread_outline')
+  const [pngIncludeLegend, setPngIncludeLegend] = useState(false)
   const [processingProgress, setProcessingProgress] = useState<ProcessingProgressEvent | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<ResultState | null>(null)
@@ -184,35 +193,30 @@ function App() {
         : 'Ready'
 
   const handleSavePng = useCallback(async () => {
-    if (!result || !isPatternReady || savingPng) {
+    if (!result || !isPatternReady || savingPng || !result.stitchMap) {
       return
     }
 
-    const downloadUrl =
-      previewMode === 'thread'
-        ? result.threadPreviewImageUrl
-        : result.outlineImageUrl
-
-    if (!downloadUrl) {
+    if (!result.outlineImageUrl || !result.threadPreviewImageUrl) {
       return
     }
 
     setSavingPng(true)
 
     try {
-      const response = await fetch(downloadUrl)
-      if (!response.ok) {
-        throw new Error(`Failed to load PNG (${response.status})`)
-      }
+      const blob = await buildPatternExportBlob({
+        variant: pngExportVariant,
+        includeLegend: pngIncludeLegend,
+        stitchMap: result.stitchMap,
+        palette: result.palette,
+        outlineImageUrl: result.outlineImageUrl,
+        threadPreviewImageUrl: result.threadPreviewImageUrl,
+      })
 
-      const blob = await response.blob()
       const blobUrl = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = blobUrl
-      link.download =
-        previewMode === 'thread'
-          ? `magpies-needle-painter-thread-colors-${numColors}.png`
-          : `magpies-needle-painter-line-pattern-${numColors}.png`
+      link.download = pngExportFilename(pngExportVariant, pngIncludeLegend, numColors)
       link.rel = 'noopener'
       document.body.appendChild(link)
       link.click()
@@ -224,27 +228,39 @@ function App() {
     } finally {
       setSavingPng(false)
     }
-  }, [isPatternReady, numColors, previewMode, result, savingPng])
+  }, [
+    isPatternReady,
+    numColors,
+    pngExportVariant,
+    pngIncludeLegend,
+    result,
+    savingPng,
+  ])
 
   useEffect(() => {
-    let unlisten: UnlistenFn | null = null
+    let cancelled = false
+    let unlisten: UnlistenFn | undefined
 
-    const attachListener = async () => {
-      unlisten = await listen<ProcessingProgressEvent>('pattern-progress', (event) => {
-        if (event.payload.requestId !== activeRequestIdRef.current) {
-          return
-        }
+    listen<ProcessingProgressEvent>('pattern-progress', (event) => {
+      if (cancelled) {
+        return
+      }
+      if (event.payload.requestId !== activeRequestIdRef.current) {
+        return
+      }
 
-        setProcessingProgress(event.payload)
-      })
-    }
-
-    void attachListener()
+      setProcessingProgress(event.payload)
+    }).then((fn) => {
+      if (cancelled) {
+        fn()
+      } else {
+        unlisten = fn
+      }
+    })
 
     return () => {
-      if (unlisten) {
-        unlisten()
-      }
+      cancelled = true
+      unlisten?.()
     }
   }, [])
 
@@ -310,6 +326,8 @@ function App() {
       if (activeRequestIdRef.current !== requestId) {
         return
       }
+
+      validateStitchMapLabelLength(res.width, res.height, labelsBuffer.byteLength)
 
       setIsolatedPaletteId(null)
 
@@ -420,21 +438,49 @@ function App() {
                 )}
               </button>
               {isPatternReady && result && !processing && (
-                <button
-                  type="button"
-                  onClick={handleSavePng}
-                  disabled={savingPng}
-                  className="magpie-button border-[var(--accent-cool)]/40 bg-[var(--accent-cool)]/12 text-[var(--accent-cool-strong)] hover:border-[var(--accent-cool)]/70 hover:bg-[var(--accent-cool)]/20"
-                >
-                  {savingPng ? (
-                    <span className="flex items-center gap-2">
-                      <span aria-hidden="true" className="magpie-button-spinner" />
-                      <span>Saving PNG</span>
+                <div className="flex w-full max-w-2xl flex-col items-stretch gap-3 sm:w-auto sm:max-w-none sm:flex-row sm:flex-wrap sm:items-center">
+                  <label className="flex min-w-[11rem] flex-col gap-1.5 text-left">
+                    <span className="magpie-label text-[10px] tracking-[0.16em] text-[var(--text-muted)]">
+                      PNG style
                     </span>
-                  ) : (
-                    'Save PNG'
-                  )}
-                </button>
+                    <select
+                      className="magpie-select"
+                      value={pngExportVariant}
+                      onChange={(event) => setPngExportVariant(event.target.value as PngExportVariant)}
+                      disabled={savingPng}
+                      aria-label="PNG export style"
+                    >
+                      <option value="line">Line pattern only</option>
+                      <option value="thread_outline">Thread colors with outline</option>
+                      <option value="thread_fill">Thread colors only (no grid)</option>
+                    </select>
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 rounded-[1.25rem] border border-white/10 bg-black/[0.18] px-4 py-2.5 text-sm text-[var(--text-soft)] hover:border-white/18">
+                    <input
+                      type="checkbox"
+                      className="magpie-checkbox"
+                      checked={pngIncludeLegend}
+                      onChange={(event) => setPngIncludeLegend(event.target.checked)}
+                      disabled={savingPng}
+                    />
+                    <span>Include thread legend</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleSavePng}
+                    disabled={savingPng}
+                    className="magpie-button border-[var(--accent-cool)]/40 bg-[var(--accent-cool)]/12 text-[var(--accent-cool-strong)] hover:border-[var(--accent-cool)]/70 hover:bg-[var(--accent-cool)]/20 sm:shrink-0"
+                  >
+                    {savingPng ? (
+                      <span className="flex items-center gap-2">
+                        <span aria-hidden="true" className="magpie-button-spinner" />
+                        <span>Saving PNG</span>
+                      </span>
+                    ) : (
+                      'Save PNG'
+                    )}
+                  </button>
+                </div>
               )}
               {processing && (
                 <div
@@ -514,7 +560,10 @@ function App() {
               <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(232,189,223,0.12),transparent_38%),radial-gradient(circle_at_bottom_right,rgba(170,174,235,0.12),transparent_28%),linear-gradient(135deg,rgba(255,255,255,0.04)_0%,transparent_42%)]" />
 
               {error && (
-                <div className="relative z-10 max-w-xl rounded-[1.8rem] border border-rose-300/30 bg-rose-300/10 p-6 text-sm text-rose-50 shadow-[0_18px_48px_rgba(115,37,77,0.16)]">
+                <div
+                  className="relative z-10 max-w-xl rounded-[1.8rem] border border-rose-300/30 bg-rose-300/10 p-6 text-sm text-rose-50 shadow-[0_18px_48px_rgba(115,37,77,0.16)]"
+                  role="alert"
+                >
                   <p className="magpie-label text-rose-100">Something Went Sideways</p>
                   <p className="mt-3 leading-7">{error}</p>
                 </div>

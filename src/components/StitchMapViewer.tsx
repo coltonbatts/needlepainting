@@ -161,6 +161,7 @@ export const StitchMapViewer = memo(function StitchMapViewer({
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const outlineCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const threadCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const isolationThreadCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const selectionMaskCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const boundaryMaskRef = useRef<Uint8Array | null>(null)
   const paletteColorsRef = useRef<ReadonlyArray<readonly [number, number, number]>>([])
@@ -264,11 +265,13 @@ export const StitchMapViewer = memo(function StitchMapViewer({
     const outlineCanvas = document.createElement('canvas')
     const outlineSupersampledCanvas = document.createElement('canvas')
     const threadCanvas = document.createElement('canvas')
+    const isolationThreadCanvas = document.createElement('canvas')
     const outlineContext = outlineCanvas.getContext('2d')
     const outlineSupersampledContext = outlineSupersampledCanvas.getContext('2d')
     const threadContext = threadCanvas.getContext('2d')
+    const isolationThreadContext = isolationThreadCanvas.getContext('2d')
 
-    if (!outlineContext || !outlineSupersampledContext || !threadContext) {
+    if (!outlineContext || !outlineSupersampledContext || !threadContext || !isolationThreadContext) {
       return
     }
 
@@ -278,9 +281,12 @@ export const StitchMapViewer = memo(function StitchMapViewer({
     outlineSupersampledCanvas.height = outlineHeight
     threadCanvas.width = width
     threadCanvas.height = height
+    isolationThreadCanvas.width = width
+    isolationThreadCanvas.height = height
 
     const outlineImage = outlineSupersampledContext.createImageData(outlineWidth, outlineHeight)
     const threadImage = threadContext.createImageData(width, height)
+    const isolationThreadImage = isolationThreadContext.createImageData(width, height)
     const outlineColors = new Uint8Array(outlineWidth * outlineHeight)
     const paletteColors = palette.map(parseHexColor)
     paletteColorsRef.current = paletteColors
@@ -313,6 +319,10 @@ export const StitchMapViewer = memo(function StitchMapViewer({
       threadImage.data[dataOffset + 1] = isVisible ? color[1] : ISOLATED_THREAD_FILL[1]
       threadImage.data[dataOffset + 2] = isVisible ? color[2] : ISOLATED_THREAD_FILL[2]
       threadImage.data[dataOffset + 3] = 255
+      isolationThreadImage.data[dataOffset] = threadImage.data[dataOffset]
+      isolationThreadImage.data[dataOffset + 1] = threadImage.data[dataOffset + 1]
+      isolationThreadImage.data[dataOffset + 2] = threadImage.data[dataOffset + 2]
+      isolationThreadImage.data[dataOffset + 3] = 255
     }
 
     for (let y = 0; y < height; y += 1) {
@@ -325,14 +335,12 @@ export const StitchMapViewer = memo(function StitchMapViewer({
             const paintX = x + delta
             if (paintX < width) {
               boundaryMask[y * width + paintX] = 1
-              if (showOutline) {
-                const hiPaintX = paintX * OUTLINE_SUPERSAMPLE
-                const hiPaintY = y * OUTLINE_SUPERSAMPLE
-                for (let dy = 0; dy < OUTLINE_SUPERSAMPLE; dy += 1) {
-                  for (let dx = 0; dx < OUTLINE_SUPERSAMPLE; dx += 1) {
-                    const hiIndex = (hiPaintY + dy) * outlineWidth + (hiPaintX + dx)
-                    outlineColors[hiIndex] = 2
-                  }
+              const hiPaintX = paintX * OUTLINE_SUPERSAMPLE
+              const hiPaintY = y * OUTLINE_SUPERSAMPLE
+              for (let dy = 0; dy < OUTLINE_SUPERSAMPLE; dy += 1) {
+                for (let dx = 0; dx < OUTLINE_SUPERSAMPLE; dx += 1) {
+                  const hiIndex = (hiPaintY + dy) * outlineWidth + (hiPaintX + dx)
+                  outlineColors[hiIndex] = 2
                 }
               }
             }
@@ -344,14 +352,12 @@ export const StitchMapViewer = memo(function StitchMapViewer({
             const paintY = y + delta
             if (paintY < height) {
               boundaryMask[paintY * width + x] = 1
-              if (showOutline) {
-                const hiPaintX = x * OUTLINE_SUPERSAMPLE
-                const hiPaintY = paintY * OUTLINE_SUPERSAMPLE
-                for (let dy = 0; dy < OUTLINE_SUPERSAMPLE; dy += 1) {
-                  for (let dx = 0; dx < OUTLINE_SUPERSAMPLE; dx += 1) {
-                    const hiIndex = (hiPaintY + dy) * outlineWidth + (hiPaintX + dx)
-                    outlineColors[hiIndex] = 2
-                  }
+              const hiPaintX = x * OUTLINE_SUPERSAMPLE
+              const hiPaintY = paintY * OUTLINE_SUPERSAMPLE
+              for (let dy = 0; dy < OUTLINE_SUPERSAMPLE; dy += 1) {
+                for (let dx = 0; dx < OUTLINE_SUPERSAMPLE; dx += 1) {
+                  const hiIndex = (hiPaintY + dy) * outlineWidth + (hiPaintX + dx)
+                  outlineColors[hiIndex] = 2
                 }
               }
             }
@@ -382,6 +388,9 @@ export const StitchMapViewer = memo(function StitchMapViewer({
         threadImage.data[dataOffset + 1] = 0
         threadImage.data[dataOffset + 2] = 0
       }
+      isolationThreadImage.data[dataOffset] = 0
+      isolationThreadImage.data[dataOffset + 1] = 0
+      isolationThreadImage.data[dataOffset + 2] = 0
     }
 
     outlineSupersampledContext.putImageData(outlineImage, 0, 0)
@@ -389,18 +398,30 @@ export const StitchMapViewer = memo(function StitchMapViewer({
     outlineContext.imageSmoothingQuality = 'high'
     outlineContext.drawImage(outlineSupersampledCanvas, 0, 0, width, height)
     threadContext.putImageData(threadImage, 0, 0)
+    isolationThreadContext.putImageData(isolationThreadImage, 0, 0)
     boundaryMaskRef.current = boundaryMask
     outlineCanvasRef.current = outlineCanvas
     threadCanvasRef.current = threadCanvas
+    isolationThreadCanvasRef.current = isolationThreadCanvas
   }, [lineThickness, palette, showOutline, stitchMap])
 
   useEffect(() => {
     const canvas = canvasRef.current
     const container = containerRef.current
-    const sourceCanvas =
+    const baseCanvas =
       previewMode === 'thread' || !showOutline ? threadCanvasRef.current : outlineCanvasRef.current
+    const selectionCanvas =
+      isolatedPaletteId === null ? threadCanvasRef.current : isolationThreadCanvasRef.current
+    const isolatedBaseCanvas = outlineCanvasRef.current ?? baseCanvas
 
-    if (!canvas || !container || !sourceCanvas || !viewport.width || !viewport.height) {
+    if (
+      !canvas ||
+      !container ||
+      !baseCanvas ||
+      !selectionCanvas ||
+      !viewport.width ||
+      !viewport.height
+    ) {
       return
     }
 
@@ -434,11 +455,9 @@ export const StitchMapViewer = memo(function StitchMapViewer({
     const shouldIsolate = isolatedPaletteId !== null && selectionMaskCanvas
 
     if (shouldIsolate) {
-      context.globalAlpha = 0.18
-      context.drawImage(sourceCanvas, 0, 0)
-      context.globalAlpha = 1
+      context.drawImage(isolatedBaseCanvas!, 0, 0)
     } else {
-      context.drawImage(sourceCanvas, 0, 0)
+      context.drawImage(baseCanvas, 0, 0)
     }
     context.restore()
 
@@ -446,7 +465,7 @@ export const StitchMapViewer = memo(function StitchMapViewer({
       context.save()
       context.translate(view.offsetX, view.offsetY)
       context.scale(view.scale, view.scale)
-      context.drawImage(sourceCanvas, 0, 0)
+      context.drawImage(selectionCanvas, 0, 0)
       context.globalCompositeOperation = 'destination-in'
       context.drawImage(selectionMaskCanvas, 0, 0)
       context.restore()
@@ -621,8 +640,19 @@ export const StitchMapViewer = memo(function StitchMapViewer({
       setIsDragging(false)
       event.currentTarget.releasePointerCapture(event.pointerId)
 
-      if (wasClick && hoveredCell) {
-        onPaletteSelect(hoveredCell.paletteIndex)
+      // Do not use `hoveredCell` here: quick taps often get pointerup before pointermove,
+      // so React state can still describe the previous cell under the cursor.
+      if (wasClick) {
+        const container = containerRef.current
+        if (container) {
+          const rect = container.getBoundingClientRect()
+          const pointX = event.clientX - rect.left
+          const pointY = event.clientY - rect.top
+          const cell = getHoveredCell(pointX, pointY, view, stitchMap)
+          if (cell) {
+            onPaletteSelect(cell.paletteIndex)
+          }
+        }
       }
     }
   }

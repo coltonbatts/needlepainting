@@ -111,7 +111,8 @@
   .magpie-button:focus-visible,
   .magpie-toggle-segment:focus-visible,
   .magpie-viewer-button:focus-visible,
-  .magpie-viewer-chip:focus-visible {
+  .magpie-viewer-chip:focus-visible,
+  .magpie-select:focus-visible {
     outline: none;
     --tw-ring-color: var(--ring);
     --tw-ring-offset-color: #120d16;
@@ -124,6 +125,33 @@
 
   .magpie-range {
     @apply w-full appearance-none bg-transparent;
+  }
+
+  .magpie-select {
+    @apply w-full cursor-pointer rounded-[1.25rem] border px-3 py-2.5 text-sm text-[var(--text-strong)] transition duration-200;
+    border-color: rgba(255, 255, 255, 0.14);
+    background: rgba(0, 0, 0, 0.22);
+  }
+
+  .magpie-select:hover:not(:disabled) {
+    border-color: rgba(255, 255, 255, 0.22);
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .magpie-select:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .magpie-checkbox {
+    @apply h-4 w-4 shrink-0 cursor-pointer rounded border accent-[var(--accent-strong)];
+    border-color: rgba(255, 255, 255, 0.28);
+    background: rgba(0, 0, 0, 0.25);
+  }
+
+  .magpie-checkbox:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
 
   .magpie-viewer-button {
