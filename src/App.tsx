@@ -29,15 +29,12 @@ interface ResultState {
 interface ProcessImageResponse {
   image_path: string
   thread_preview_path: string
+  labels_path: string
   width: number
   height: number
-  labels: number[]
   palette: PaletteEntry[]
   metrics: ProcessMetrics
 }
-
-type ProcessingMode = 'preview' | 'final'
-type PreviewImageResponse = number[]
 
 interface SliderProps {
   label: string
@@ -62,8 +59,6 @@ const PROCESSING_STAGES: ProcessingStageDefinition[] = [
   { key: 'preparing_preview', label: 'Preparing preview' },
 ]
 
-const PREVIEW_BUDGET_MS = 150
-
 function createProcessRequestId() {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
     return crypto.randomUUID()
@@ -75,32 +70,6 @@ function createProcessRequestId() {
 function getFileName(filePath: string) {
   const normalized = filePath.replace(/\\/g, '/')
   return normalized.split('/').pop() || filePath
-}
-
-function mimeTypeFromPath(filePath: string) {
-  const normalized = filePath.toLowerCase()
-
-  if (normalized.endsWith('.png')) return 'image/png'
-  if (normalized.endsWith('.jpg') || normalized.endsWith('.jpeg')) return 'image/jpeg'
-  if (normalized.endsWith('.webp')) return 'image/webp'
-  if (normalized.endsWith('.bmp')) return 'image/bmp'
-  if (normalized.endsWith('.tiff') || normalized.endsWith('.tif')) return 'image/tiff'
-
-  return 'application/octet-stream'
-}
-
-function clearTimer(ref: { current: ReturnType<typeof setTimeout> | null }) {
-  if (ref.current !== null) {
-    clearTimeout(ref.current)
-    ref.current = null
-  }
-}
-
-function revokeBlobUrl(ref: { current: string | null }) {
-  if (ref.current) {
-    URL.revokeObjectURL(ref.current)
-    ref.current = null
-  }
 }
 
 function ControlSlider({
@@ -147,17 +116,14 @@ function App() {
   const [downscaleMax, setDownscaleMax] = useState(800)
   const [minRegionSize, setMinRegionSize] = useState(50)
   const [previewMode, setPreviewMode] = useState<PreviewMode>('outline')
+  const [showOutline, setShowOutline] = useState(true)
   const [processing, setProcessing] = useState(false)
+  const [savingPng, setSavingPng] = useState(false)
   const [processingProgress, setProcessingProgress] = useState<ProcessingProgressEvent | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<ResultState | null>(null)
   const [isolatedPaletteId, setIsolatedPaletteId] = useState<number | null>(null)
   const activeRequestIdRef = useRef<string | null>(null)
-  const sourceBlobUrlRef = useRef<string | null>(null)
-  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const finalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const previewSuppressedUntilRef = useRef<number>(0)
-  const lastScheduledSignatureRef = useRef<string | null>(null)
   const isPatternReady = Boolean(
     result &&
       result.outlineImageUrl &&
@@ -174,21 +140,39 @@ function App() {
       : result.sourceImageUrl
     : null
   const currentStageLabel = processingProgress?.label ?? 'Processing'
-  const currentSettingsSignature = `${numColors}:${lineThickness}:${downscaleMax}:${minRegionSize}`
+  const processingProgressLabel = processingProgress
+    ? `${currentStageLabel} · ${Math.round(processingProgress.progress * 100)}%`
+    : currentStageLabel
+  const processingHint = 'Loading the image, reducing colors, matching threads, and building the preview.'
   const previewTitle = processing
     ? 'Processing'
     : isPatternReady
       ? previewMode === 'thread'
-        ? 'Thread Colors'
-        : 'Line Pattern'
+        ? showOutline
+          ? 'Thread Colors'
+          : 'Color Only'
+        : showOutline
+          ? 'Line Pattern'
+          : 'Color Only'
       : result
         ? 'Photo'
         : 'Preview'
+  const previewDisplayLabel =
+    previewMode === 'thread'
+      ? showOutline
+        ? 'thread colors'
+        : 'color only'
+      : showOutline
+        ? 'line pattern'
+        : 'color only'
   const previewSubtitle = result
     ? processing
       ? `${result.fileName} · ${currentStageLabel}`
       : result.fileName
     : 'Choose a photo to begin.'
+  const sortedPalette = result
+    ? [...result.palette].sort((a, b) => b.region_count - a.region_count || a.pal_id - b.pal_id)
+    : []
   const statusText = processing
     ? `${currentStageLabel}${processingProgress ? ` · ${Math.round(processingProgress.progress * 100)}%` : ''}`
     : hasPalette
@@ -198,6 +182,49 @@ function App() {
       : result
         ? 'Photo loaded'
         : 'Ready'
+
+  const handleSavePng = useCallback(async () => {
+    if (!result || !isPatternReady || savingPng) {
+      return
+    }
+
+    const downloadUrl =
+      previewMode === 'thread'
+        ? result.threadPreviewImageUrl
+        : result.outlineImageUrl
+
+    if (!downloadUrl) {
+      return
+    }
+
+    setSavingPng(true)
+
+    try {
+      const response = await fetch(downloadUrl)
+      if (!response.ok) {
+        throw new Error(`Failed to load PNG (${response.status})`)
+      }
+
+      const blob = await response.blob()
+      const blobUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = blobUrl
+      link.download =
+        previewMode === 'thread'
+          ? `magpies-needle-painter-thread-colors-${numColors}.png`
+          : `magpies-needle-painter-line-pattern-${numColors}.png`
+      link.rel = 'noopener'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(blobUrl)
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      setError(`Could not save PNG: ${message}`)
+    } finally {
+      setSavingPng(false)
+    }
+  }, [isPatternReady, numColors, previewMode, result, savingPng])
 
   useEffect(() => {
     let unlisten: UnlistenFn | null = null
@@ -225,142 +252,6 @@ function App() {
     setIsolatedPaletteId((current) => (current === paletteId ? null : paletteId))
   }, [])
 
-  const clearScheduledRuns = useCallback(() => {
-    clearTimer(previewTimerRef)
-    clearTimer(finalTimerRef)
-  }, [])
-
-  const startProcessing = useCallback(
-    async (mode: ProcessingMode) => {
-      if (!result?.filePath) return
-
-      const requestId = createProcessRequestId()
-      activeRequestIdRef.current = requestId
-      lastScheduledSignatureRef.current = currentSettingsSignature
-      setProcessing(true)
-      setError(null)
-      setProcessingProgress({
-        requestId,
-        stage: 'loading_image',
-        label: mode === 'preview' ? 'Building preview' : 'Loading image',
-        stageIndex: 1,
-        totalStages: PROCESSING_STAGES.length,
-        progress: 0,
-      })
-
-      try {
-        const res = (await invoke('process_image', {
-          imagePath: result.filePath,
-          requestId,
-          numColors,
-          lineThickness,
-          downscaleMax,
-          minRegionSize,
-          preview: mode === 'preview',
-        })) as ProcessImageResponse
-
-        if (activeRequestIdRef.current !== requestId) {
-          return
-        }
-
-        const outlineUrl = convertFileSrc(res.image_path)
-        const threadPreviewUrl = convertFileSrc(res.thread_preview_path)
-        setIsolatedPaletteId(null)
-
-        if (mode === 'preview') {
-          previewSuppressedUntilRef.current =
-            res.metrics.timings.totalMs > PREVIEW_BUDGET_MS
-              ? Date.now() + 2000
-              : 0
-        }
-
-        setResult((prev) =>
-          prev
-            ? {
-                ...prev,
-                outlineImageUrl: outlineUrl,
-                threadPreviewImageUrl: threadPreviewUrl,
-                width: res.width,
-                height: res.height,
-                palette: res.palette,
-                stitchMap: {
-                  width: res.width,
-                  height: res.height,
-                  labels: res.labels,
-                },
-                metrics: res.metrics,
-              }
-            : null,
-        )
-      } catch (e: unknown) {
-        if (activeRequestIdRef.current === requestId) {
-          const errMsg = e instanceof Error ? e.message : String(e)
-          setError(errMsg)
-        }
-      } finally {
-        if (activeRequestIdRef.current === requestId) {
-          activeRequestIdRef.current = null
-          setProcessing(false)
-        }
-      }
-    },
-    [currentSettingsSignature, downscaleMax, lineThickness, minRegionSize, numColors, result?.filePath],
-  )
-
-  useEffect(() => {
-    return () => {
-      revokeBlobUrl(sourceBlobUrlRef)
-      clearScheduledRuns()
-    }
-  }, [clearScheduledRuns])
-
-  useEffect(() => {
-    if (!result?.filePath || !result.metrics) {
-      return
-    }
-
-    const signature = currentSettingsSignature
-    if (signature === lastScheduledSignatureRef.current) {
-      return
-    }
-
-    clearScheduledRuns()
-
-    const settingsChangedOnlyThickness =
-      result.metrics.numColors === numColors &&
-      result.metrics.downscaleMax === downscaleMax &&
-      result.metrics.minRegionSize === minRegionSize &&
-      result.metrics.lineThickness !== lineThickness
-
-    const shouldRunPreview =
-      !settingsChangedOnlyThickness && Date.now() >= previewSuppressedUntilRef.current
-
-    if (shouldRunPreview) {
-      previewTimerRef.current = setTimeout(() => {
-        void startProcessing('preview')
-      }, 140)
-    }
-
-    finalTimerRef.current = setTimeout(
-      () => {
-        void startProcessing('final')
-      },
-      shouldRunPreview ? 700 : 320,
-    )
-
-    lastScheduledSignatureRef.current = signature
-  }, [
-    clearScheduledRuns,
-    currentSettingsSignature,
-    downscaleMax,
-    lineThickness,
-    minRegionSize,
-    numColors,
-    result?.filePath,
-    result?.metrics,
-    startProcessing,
-  ])
-
   const updateImageDimensions = useCallback((width: number, height: number) => {
     setResult((prev) => {
       if (!prev) return null
@@ -375,9 +266,83 @@ function App() {
   }, [])
 
   const handleProcess = useCallback(async () => {
-    clearScheduledRuns()
-    await startProcessing('final')
-  }, [clearScheduledRuns, startProcessing])
+    if (!result?.filePath || processing) return
+
+    const requestId = createProcessRequestId()
+    activeRequestIdRef.current = requestId
+    setProcessing(true)
+    setError(null)
+    setProcessingProgress({
+      requestId,
+      stage: 'loading_image',
+      label: 'Loading image',
+      stageIndex: 1,
+      totalStages: PROCESSING_STAGES.length,
+      progress: 0,
+    })
+
+    try {
+      const res = (await invoke('process_image', {
+        imagePath: result.filePath,
+        requestId,
+        numColors,
+        lineThickness,
+        downscaleMax,
+        minRegionSize,
+        preview: false,
+      })) as ProcessImageResponse
+
+      if (activeRequestIdRef.current !== requestId) {
+        return
+      }
+
+      const outlineUrl = convertFileSrc(res.image_path)
+      const threadPreviewUrl = convertFileSrc(res.thread_preview_path)
+      const labelsUrl = convertFileSrc(res.labels_path)
+      const labelsBuffer = await fetch(labelsUrl).then((response) => {
+        if (!response.ok) {
+          throw new Error(`Failed to load stitch map labels (${response.status})`)
+        }
+
+        return response.arrayBuffer()
+      })
+
+      if (activeRequestIdRef.current !== requestId) {
+        return
+      }
+
+      setIsolatedPaletteId(null)
+
+      setResult((prev) =>
+        prev
+          ? {
+              ...prev,
+              outlineImageUrl: outlineUrl,
+              threadPreviewImageUrl: threadPreviewUrl,
+              width: res.width,
+              height: res.height,
+              palette: res.palette,
+              stitchMap: {
+                width: res.width,
+                height: res.height,
+                labels: new Uint8Array(labelsBuffer),
+              },
+              metrics: res.metrics,
+            }
+          : null,
+      )
+    } catch (e: unknown) {
+      if (activeRequestIdRef.current === requestId) {
+        const errMsg = e instanceof Error ? e.message : String(e)
+        setError(errMsg)
+      }
+    } finally {
+      if (activeRequestIdRef.current === requestId) {
+        activeRequestIdRef.current = null
+        setProcessing(false)
+      }
+    }
+  }, [downscaleMax, lineThickness, minRegionSize, numColors, processing, result?.filePath])
 
   const handlePickFile = useCallback(async () => {
     setError(null)
@@ -394,25 +359,13 @@ function App() {
 
       if (typeof selected === 'string') {
         activeRequestIdRef.current = null
-        clearScheduledRuns()
         setProcessing(false)
         setProcessingProgress(null)
         setPreviewMode('outline')
+        setShowOutline(true)
         setIsolatedPaletteId(null)
         setError(null)
-        lastScheduledSignatureRef.current = null
-        previewSuppressedUntilRef.current = 0
-
-        const previewBytes = (await invoke('load_image_preview', {
-          imagePath: selected,
-        })) as PreviewImageResponse
-        const previewUrl = URL.createObjectURL(
-          new Blob([new Uint8Array(previewBytes)], {
-            type: mimeTypeFromPath(selected),
-          }),
-        )
-        revokeBlobUrl(sourceBlobUrlRef)
-        sourceBlobUrlRef.current = previewUrl
+        const previewUrl = convertFileSrc(selected)
 
         setResult({
           sourceImageUrl: previewUrl,
@@ -431,7 +384,7 @@ function App() {
       const errMsg = e instanceof Error ? e.message : String(e)
       setError(`Could not open that photo: ${errMsg}`)
     }
-  }, [clearScheduledRuns])
+  }, [])
 
   return (
     <div className="flex min-h-screen flex-col bg-transparent text-[var(--text-main)]">
@@ -444,30 +397,53 @@ function App() {
 
             <div className="flex flex-wrap justify-center gap-3">
               <button
+                type="button"
                 onClick={handlePickFile}
                 className="magpie-button border-white/12 bg-white/[0.07] text-[var(--text-strong)] hover:border-white/25 hover:bg-white/12"
               >
                 Choose Photo
               </button>
               <button
+                type="button"
                 onClick={handleProcess}
                 disabled={!result?.filePath || processing}
-                className="magpie-button border-[var(--accent-strong)]/40 bg-[var(--accent-strong)] text-[#221622] shadow-[0_18px_40px_rgba(227,181,213,0.22)] hover:-translate-y-px hover:bg-[var(--accent-soft)]"
+                aria-busy={processing}
+                className="magpie-button min-w-[11.5rem] border-[var(--accent-strong)]/40 bg-[var(--accent-strong)] text-[#221622] shadow-[0_18px_40px_rgba(227,181,213,0.22)] hover:-translate-y-px hover:bg-[var(--accent-soft)] disabled:translate-y-0"
               >
-                {processing ? 'Making Pattern' : 'Make Pattern'}
+                {processing ? (
+                  <span className="flex items-center gap-2">
+                    <span aria-hidden="true" className="magpie-button-spinner" />
+                    <span>Making Pattern</span>
+                  </span>
+                ) : (
+                  'Make Pattern'
+                )}
               </button>
               {isPatternReady && result && !processing && (
-                <a
-                  href={activePreviewUrl ?? result.outlineImageUrl ?? result.sourceImageUrl}
-                  download={
-                    previewMode === 'thread'
-                      ? `magpies-needle-painter-thread-colors-${numColors}.png`
-                      : `magpies-needle-painter-line-pattern-${numColors}.png`
-                  }
+                <button
+                  type="button"
+                  onClick={handleSavePng}
+                  disabled={savingPng}
                   className="magpie-button border-[var(--accent-cool)]/40 bg-[var(--accent-cool)]/12 text-[var(--accent-cool-strong)] hover:border-[var(--accent-cool)]/70 hover:bg-[var(--accent-cool)]/20"
                 >
-                  Save PNG
-                </a>
+                  {savingPng ? (
+                    <span className="flex items-center gap-2">
+                      <span aria-hidden="true" className="magpie-button-spinner" />
+                      <span>Saving PNG</span>
+                    </span>
+                  ) : (
+                    'Save PNG'
+                  )}
+                </button>
+              )}
+              {processing && (
+                <div
+                  className="flex items-center gap-2 rounded-full border border-white/10 bg-black/[0.18] px-4 py-2 font-mono text-[10px] uppercase tracking-[0.22em] text-[var(--text-soft)]"
+                  aria-live="polite"
+                >
+                  <span aria-hidden="true" className="magpie-button-spinner h-3.5 w-3.5" />
+                  <span>{processingProgressLabel}</span>
+                </div>
               )}
             </div>
           </div>
@@ -512,6 +488,18 @@ function App() {
                     >
                       Threads
                     </button>
+                    <button
+                      type="button"
+                      aria-pressed={showOutline}
+                      className={`magpie-toggle-segment ${
+                        showOutline
+                          ? 'bg-[var(--accent-strong)] text-[#241625] shadow-[0_10px_28px_rgba(227,181,213,0.28)]'
+                          : 'text-[var(--text-soft)] hover:bg-white/10'
+                      }`}
+                      onClick={() => setShowOutline((current) => !current)}
+                    >
+                      Outline
+                    </button>
                   </div>
                 )}
                 {result && (
@@ -552,7 +540,8 @@ function App() {
                         stitchMap={result.stitchMap}
                         palette={result.palette}
                         previewMode={previewMode}
-                        lineThickness={lineThickness}
+                        showOutline={showOutline}
+                        lineThickness={result.metrics?.lineThickness ?? lineThickness}
                         isolatedPaletteId={isolatedPaletteId}
                         onPaletteSelect={togglePaletteIsolation}
                       />
@@ -665,7 +654,7 @@ function App() {
                   </p>
                   <p className="text-[var(--text-muted)]">
                     {result
-                      ? `${result.width} x ${result.height}${processing ? ' · processing' : isPatternReady ? ` · ${previewMode === 'thread' ? 'thread colors' : 'line pattern'}` : ''}`
+                      ? `${result.width} x ${result.height}${processing ? ' · processing' : isPatternReady ? ` · ${previewDisplayLabel}` : ''}`
                       : 'Choose a photo to load it here.'}
                   </p>
                   {result?.metrics && (
@@ -701,7 +690,7 @@ function App() {
 
                 {processing && (
                   <p className="mt-3 text-sm leading-6 text-[var(--text-soft)]">
-                    Thread details appear after the new pattern is ready.
+                    {processingHint}
                   </p>
                 )}
 
@@ -714,9 +703,9 @@ function App() {
                 {!processing && hasPalette && result && (
                   <div className="mt-4 space-y-2">
                     <p className="text-xs leading-5 text-[var(--text-muted)]">
-                      Select a thread to isolate it in the pattern view.
+                      Largest coverage first. Select a thread to isolate it in the pattern view.
                     </p>
-                    {result.palette.map((entry) => (
+                    {sortedPalette.map((entry) => (
                       <button
                         type="button"
                         key={entry.pal_id}

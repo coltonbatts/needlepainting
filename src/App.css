@@ -99,6 +99,15 @@
     box-shadow: 0 0 0 rgba(0, 0, 0, 0);
   }
 
+  .magpie-button-spinner {
+    @apply inline-block shrink-0 rounded-full;
+    width: 0.95rem;
+    height: 0.95rem;
+    border: 1.5px solid rgba(38, 22, 39, 0.24);
+    border-top-color: rgba(38, 22, 39, 0.88);
+    animation: magpie-spin 0.85s linear infinite;
+  }
+
   .magpie-button:focus-visible,
   .magpie-toggle-segment:focus-visible,
   .magpie-viewer-button:focus-visible,
@@ -232,6 +241,10 @@
 
   .magpie-processing-bar {
     transition: none;
+  }
+
+  .magpie-button-spinner {
+    animation: none;
   }
 }
 

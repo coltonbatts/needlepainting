@@ -12,7 +12,7 @@ export interface PaletteEntry {
 export interface StitchMapData {
   width: number
   height: number
-  labels: number[]
+  labels: Uint8Array
 }
 
 export interface StageTimings {

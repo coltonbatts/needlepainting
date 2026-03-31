@@ -4,6 +4,7 @@ use tauri::{Emitter, Window};
 use std::{
     fs,
     path::PathBuf,
+    sync::OnceLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,9 +39,9 @@ pub struct PaletteEntry {
 pub struct ColoringBookResult {
     pub image_path: String,
     pub thread_preview_path: String,
+    pub labels_path: String,
     pub width: u32,
     pub height: u32,
-    pub labels: Vec<u8>,
     pub palette: Vec<PaletteEntry>,
     pub metrics: RunMetrics,
 }
@@ -114,6 +115,13 @@ const PREVIEW_ITERATIONS: usize = 8;
 const FINAL_ITERATIONS: usize = 20;
 const PREVIEW_SCALE_FACTOR: f64 = 0.65;
 
+struct CachedDmcLookup {
+    colors: Vec<DMCColor>,
+    labs: Vec<[f64; 3]>,
+}
+
+static DMC_LOOKUP: OnceLock<CachedDmcLookup> = OnceLock::new();
+
 fn temp_output_path(prefix: &str, request_id: &str, suffix: &str) -> Result<PathBuf, String> {
     let mut dir = std::env::temp_dir();
     dir.push("magpie-needle-painter");
@@ -136,6 +144,13 @@ fn write_png_to_temp(prefix: &str, request_id: &str, bytes: &[u8]) -> Result<Pat
     let path = temp_output_path(prefix, request_id, "png")?;
     fs::write(&path, bytes)
         .map_err(|e| format!("Failed to write PNG to temp file '{}': {}", path.display(), e))?;
+    Ok(path)
+}
+
+fn write_labels_to_temp(prefix: &str, request_id: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = temp_output_path(prefix, request_id, "bin")?;
+    fs::write(&path, bytes)
+        .map_err(|e| format!("Failed to write labels to temp file '{}': {}", path.display(), e))?;
     Ok(path)
 }
 
@@ -172,6 +187,18 @@ const DMC_JSON: &str = include_str!("../data/dmc-floss.json");
 
 fn parse_dmc() -> Vec<DMCColor> {
     serde_json::from_str(DMC_JSON).expect("failed to parse DMC JSON")
+}
+
+fn dmc_lookup() -> &'static CachedDmcLookup {
+    DMC_LOOKUP.get_or_init(|| {
+        let colors = parse_dmc();
+        let labs = colors
+            .iter()
+            .map(|c| rgb_to_lab(c.rgb.r, c.rgb.g, c.rgb.b))
+            .collect();
+
+        CachedDmcLookup { colors, labs }
+    })
 }
 
 // --- Color science ---
@@ -243,7 +270,7 @@ fn kmeans_quantize(
             let mut best_label = 0u8;
             let mut best_dist = f64::MAX;
             for (l, c) in centroids.iter().enumerate() {
-                let d = rgb_dist(px, *c);
+                let d = rgb_dist_sq(px, *c);
                 if d < best_dist {
                     best_dist = d;
                     best_label = l as u8;
@@ -279,11 +306,11 @@ fn kmeans_quantize(
     (centroids, labels)
 }
 
-fn rgb_dist(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+fn rgb_dist_sq(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
     let dr = a.0 as f64 - b.0 as f64;
     let dg = a.1 as f64 - b.1 as f64;
     let db = a.2 as f64 - b.2 as f64;
-    (dr * dr + dg * dg + db * db).sqrt()
+    dr * dr + dg * dg + db * db
 }
 
 struct SimpleRng(u64);
@@ -304,11 +331,7 @@ impl SimpleRng {
 // --- Map centroids -> DMC ---
 
 fn map_to_dmc(centroids: &[(u8, u8, u8)]) -> Vec<PaletteEntry> {
-    let dmc = parse_dmc();
-    let dmc_lab: Vec<[f64; 3]> = dmc
-        .iter()
-        .map(|c| rgb_to_lab(c.rgb.r, c.rgb.g, c.rgb.b))
-        .collect();
+    let dmc = dmc_lookup();
 
     centroids
         .iter()
@@ -317,14 +340,14 @@ fn map_to_dmc(centroids: &[(u8, u8, u8)]) -> Vec<PaletteEntry> {
             let cl = rgb_to_lab(c.0, c.1, c.2);
             let mut best_idx = 0usize;
             let mut best_dist = f64::MAX;
-            for (i, &lab) in dmc_lab.iter().enumerate() {
+            for (i, &lab) in dmc.labs.iter().enumerate() {
                 let d = delta_e(cl, lab);
                 if d < best_dist {
                     best_dist = d;
                     best_idx = i;
                 }
             }
-            let best = &dmc[best_idx];
+            let best = &dmc.colors[best_idx];
             PaletteEntry {
                 pal_id: idx as u8,
                 dmc_number: best.number.clone(),
@@ -758,6 +781,7 @@ pub fn process_image(
         .map_err(|e| format!("Thread preview PNG encode failed: {}", e))?;
     let image_path = write_png_to_temp("outline", &request_id, &png_bytes)?;
     let thread_preview_path = write_png_to_temp("thread", &request_id, &thread_preview_bytes)?;
+    let labels_path = write_labels_to_temp("labels", &request_id, &merged_labels)?;
     let png_encode_ms = png_encode_start.elapsed().as_secs_f64() * 1000.0;
 
     emit_progress(
@@ -825,9 +849,9 @@ pub fn process_image(
     Ok(ColoringBookResult {
         image_path: image_path.to_string_lossy().into_owned(),
         thread_preview_path: thread_preview_path.to_string_lossy().into_owned(),
+        labels_path: labels_path.to_string_lossy().into_owned(),
         width: working_width,
         height: working_height,
-        labels: merged_labels,
         palette,
         metrics,
     })
