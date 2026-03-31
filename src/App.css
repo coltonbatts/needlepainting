@@ -264,6 +264,74 @@
   transition: width 220ms ease;
 }
 
+.magpie-processing-bar-track--indeterminate {
+  contain: layout style;
+}
+
+.magpie-processing-bar--indeterminate {
+  width: 38% !important;
+  min-width: 4.5rem;
+  background: linear-gradient(
+    90deg,
+    rgba(166, 172, 207, 0.45),
+    rgba(235, 193, 221, 0.98),
+    rgba(210, 188, 244, 0.92),
+    rgba(166, 172, 207, 0.45)
+  );
+  background-size: 200% 100%;
+  animation: magpie-indeterminate-sweep 1.25s ease-in-out infinite;
+  box-shadow:
+    0 0 28px rgba(235, 193, 221, 0.35),
+    0 0 12px rgba(166, 172, 207, 0.22);
+}
+
+@keyframes magpie-indeterminate-sweep {
+  0% {
+    transform: translateX(-115%);
+  }
+
+  100% {
+    transform: translateX(290%);
+  }
+}
+
+/* No opacity in keyframes + forwards only: `both` kept the panel at opacity:0 until the first
+   animation tick; in Tauri/WebKit a busy main thread can delay that tick until work finishes,
+   so the full processing UI looked invisible while the header spinner still ran. */
+.magpie-processing-root {
+  opacity: 1;
+  animation: magpie-processing-enter 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes magpie-processing-enter {
+  from {
+    transform: scale(0.988);
+  }
+
+  to {
+    transform: scale(1);
+  }
+}
+
+.magpie-button--pattern-active {
+  animation: magpie-button-pulse-glow 1.35s ease-in-out infinite;
+}
+
+@keyframes magpie-button-pulse-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 18px 40px rgba(227, 181, 213, 0.22),
+      0 0 0 0 rgba(227, 181, 213, 0.24);
+  }
+
+  50% {
+    box-shadow:
+      0 20px 48px rgba(227, 181, 213, 0.32),
+      0 0 0 6px rgba(227, 181, 213, 0.12);
+  }
+}
+
 @keyframes magpie-spin {
   from {
     transform: rotate(0deg);
@@ -281,6 +349,21 @@
 
   .magpie-processing-bar {
     transition: none;
+  }
+
+  .magpie-processing-bar--indeterminate {
+    animation: none;
+    transform: translateX(0);
+    width: 100% !important;
+    opacity: 0.85;
+  }
+
+  .magpie-processing-root {
+    animation: none;
+  }
+
+  .magpie-button--pattern-active {
+    animation: none;
   }
 
   .magpie-button-spinner {

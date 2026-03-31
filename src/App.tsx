@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import { ProcessingPreview } from './components/ProcessingPreview'
 import { StitchMapViewer } from './components/StitchMapViewer'
@@ -14,6 +16,7 @@ import type {
   StitchMapData,
 } from './types'
 import { buildPatternExportBlob, pngExportFilename } from './utils/stitchExport'
+import { playPatternKickoffChime } from './utils/patternKickoffSound'
 import { validateStitchMapLabelLength } from './utils/stitchMapValidation'
 
 interface ResultState {
@@ -70,9 +73,27 @@ function createProcessRequestId() {
   return `pattern-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+/** Lets the browser paint after DOM updates before long synchronous or IPC-heavy work. */
+function waitForPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve())
+    })
+  })
+}
+
 function getFileName(filePath: string) {
   const normalized = filePath.replace(/\\/g, '/')
   return normalized.split('/').pop() || filePath
+}
+
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif', 'webp'])
+
+function isImagePath(filePath: string): boolean {
+  const base = filePath.replace(/\\/g, '/').split('/').pop() ?? ''
+  const dot = base.lastIndexOf('.')
+  if (dot < 0) return false
+  return IMAGE_EXTENSIONS.has(base.slice(dot + 1).toLowerCase())
 }
 
 function ControlSlider({
@@ -132,6 +153,7 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<ResultState | null>(null)
   const [isolatedPaletteId, setIsolatedPaletteId] = useState<number | null>(null)
+  const [photoDropActive, setPhotoDropActive] = useState(false)
   const activeRequestIdRef = useRef<string | null>(null)
   const isPatternReady = Boolean(
     result &&
@@ -178,7 +200,7 @@ function App() {
     ? processing
       ? `${result.fileName} · ${currentStageLabel}`
       : result.fileName
-    : 'Choose a photo to begin.'
+    : ''
   const sortedPalette = result
     ? [...result.palette].sort((a, b) => b.region_count - a.region_count || a.pal_id - b.pal_id)
     : []
@@ -285,17 +307,22 @@ function App() {
     if (!result?.filePath || processing) return
 
     const requestId = createProcessRequestId()
-    activeRequestIdRef.current = requestId
-    setProcessing(true)
-    setError(null)
-    setProcessingProgress({
-      requestId,
-      stage: 'loading_image',
-      label: 'Loading image',
-      stageIndex: 1,
-      totalStages: PROCESSING_STAGES.length,
-      progress: 0,
+    playPatternKickoffChime()
+    flushSync(() => {
+      activeRequestIdRef.current = requestId
+      setProcessing(true)
+      setError(null)
+      setProcessingProgress({
+        requestId,
+        stage: 'loading_image',
+        label: 'Stitching',
+        stageIndex: 1,
+        totalStages: PROCESSING_STAGES.length,
+        progress: 0,
+      })
     })
+
+    await waitForPaint()
 
     try {
       const res = (await invoke('process_image', {
@@ -362,9 +389,41 @@ function App() {
     }
   }, [downscaleMax, lineThickness, minRegionSize, numColors, processing, result?.filePath])
 
-  const handlePickFile = useCallback(async () => {
-    setError(null)
+  const loadPhotoFromPath = useCallback((selected: string) => {
+    if (!isImagePath(selected)) {
+      setError('That file type is not supported. Use PNG, JPEG, WebP, BMP, or TIFF.')
+      return
+    }
 
+    try {
+      activeRequestIdRef.current = null
+      setProcessing(false)
+      setProcessingProgress(null)
+      setPreviewMode('outline')
+      setShowOutline(true)
+      setIsolatedPaletteId(null)
+      setError(null)
+      const previewUrl = convertFileSrc(selected)
+
+      setResult({
+        sourceImageUrl: previewUrl,
+        outlineImageUrl: null,
+        threadPreviewImageUrl: null,
+        width: 0,
+        height: 0,
+        palette: [],
+        filePath: selected,
+        fileName: getFileName(selected),
+        stitchMap: null,
+        metrics: null,
+      })
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e)
+      setError(`Could not open that photo: ${errMsg}`)
+    }
+  }, [])
+
+  const handlePickFile = useCallback(async () => {
     try {
       const selected = await dialogOpen({
         title: "Choose a photo for Magpie's Needle Painter",
@@ -376,33 +435,52 @@ function App() {
       })
 
       if (typeof selected === 'string') {
-        activeRequestIdRef.current = null
-        setProcessing(false)
-        setProcessingProgress(null)
-        setPreviewMode('outline')
-        setShowOutline(true)
-        setIsolatedPaletteId(null)
-        setError(null)
-        const previewUrl = convertFileSrc(selected)
-
-        setResult({
-          sourceImageUrl: previewUrl,
-          outlineImageUrl: null,
-          threadPreviewImageUrl: null,
-          width: 0,
-          height: 0,
-          palette: [],
-          filePath: selected,
-          fileName: getFileName(selected),
-          stitchMap: null,
-          metrics: null,
-        })
+        loadPhotoFromPath(selected)
       }
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : String(e)
       setError(`Could not open that photo: ${errMsg}`)
     }
-  }, [])
+  }, [loadPhotoFromPath])
+
+  useEffect(() => {
+    let cancelled = false
+    let unlistenDrag: UnlistenFn | undefined
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const p = event.payload
+        if (p.type === 'enter' || p.type === 'over') {
+          if (p.type === 'enter' && p.paths.some(isImagePath)) {
+            setPhotoDropActive(true)
+          }
+          return
+        }
+        if (p.type === 'leave') {
+          setPhotoDropActive(false)
+          return
+        }
+        if (p.type === 'drop') {
+          setPhotoDropActive(false)
+          const path = p.paths.find(isImagePath)
+          if (path) {
+            loadPhotoFromPath(path)
+          }
+        }
+      })
+      .then((fn) => {
+        if (!cancelled) {
+          unlistenDrag = fn
+        } else {
+          fn()
+        }
+      })
+
+    return () => {
+      cancelled = true
+      unlistenDrag?.()
+    }
+  }, [loadPhotoFromPath])
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-transparent text-[var(--text-main)]">
@@ -426,7 +504,7 @@ function App() {
                 onClick={handleProcess}
                 disabled={!result?.filePath || processing}
                 aria-busy={processing}
-                className="magpie-button min-w-[11.5rem] border-[var(--accent-strong)]/40 bg-[var(--accent-strong)] text-[#221622] shadow-[0_18px_40px_rgba(227,181,213,0.22)] hover:-translate-y-px hover:bg-[var(--accent-soft)] disabled:translate-y-0"
+                className={`magpie-button min-w-[11.5rem] border-[var(--accent-strong)]/40 bg-[var(--accent-strong)] text-[#221622] shadow-[0_18px_40px_rgba(227,181,213,0.22)] hover:-translate-y-px hover:bg-[var(--accent-soft)] disabled:translate-y-0 ${processing ? 'magpie-button--pattern-active' : ''}`}
               >
                 {processing ? (
                   <span className="flex items-center gap-2">
@@ -502,7 +580,9 @@ function App() {
             <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 lg:flex-row lg:items-center lg:justify-between lg:px-6">
               <div>
                 <p className="magpie-label">{previewTitle}</p>
-                <p className="mt-2 text-sm text-[var(--text-soft)]">{previewSubtitle}</p>
+                {previewSubtitle ? (
+                  <p className="mt-2 text-sm text-[var(--text-soft)]">{previewSubtitle}</p>
+                ) : null}
               </div>
               <div className="flex flex-wrap items-center gap-3">
                 {isPatternReady && !processing && (
@@ -556,7 +636,9 @@ function App() {
               </div>
             </div>
 
-            <div className="relative flex min-h-0 flex-1 items-stretch justify-stretch overflow-hidden p-4 lg:p-5">
+            <div
+              className={`relative flex min-h-0 flex-1 overflow-hidden p-4 lg:p-5 ${!result ? 'items-center justify-center' : 'items-stretch justify-stretch'}`}
+            >
               <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(232,189,223,0.12),transparent_38%),radial-gradient(circle_at_bottom_right,rgba(170,174,235,0.12),transparent_28%),linear-gradient(135deg,rgba(255,255,255,0.04)_0%,transparent_42%)]" />
 
               {error && (
@@ -570,64 +652,73 @@ function App() {
               )}
 
               {!result && !error && (
-                <div className="relative z-10 max-w-xl rounded-[2rem] border border-dashed border-white/15 bg-black/[0.18] px-8 py-10 text-center shadow-[0_20px_50px_rgba(10,6,16,0.18)]">
-                  <p className="magpie-label text-[var(--accent-soft)]">No Photo Yet</p>
-                  <h2 className="magpie-display mt-4 text-3xl font-semibold text-[var(--text-strong)]">
-                    Load a photo.
-                  </h2>
-                  <p className="mt-4 text-base leading-7 text-[var(--text-soft)]">
-                    Then generate the pattern.
-                  </p>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handlePickFile()
+                  }}
+                  className={`relative z-10 flex h-40 w-40 shrink-0 cursor-pointer flex-col items-center justify-center rounded-[2rem] border-2 border-dashed border-white/18 bg-black/[0.22] text-[var(--accent-soft)] shadow-[0_24px_56px_rgba(10,6,16,0.22)] backdrop-blur-sm transition-[border-color,background-color,box-shadow,transform,color] duration-200 hover:border-white/32 hover:bg-black/[0.3] hover:text-[var(--accent-strong)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[var(--accent-soft)] active:scale-[0.97] sm:h-48 sm:w-48 ${
+                    photoDropActive
+                      ? 'scale-[1.02] border-[var(--accent-strong)]/60 bg-[var(--accent-strong)]/12 text-[var(--accent-strong)] shadow-[0_0_0_4px_rgba(227,181,213,0.12),0_24px_56px_rgba(10,6,16,0.26)]'
+                      : ''
+                  }`}
+                  aria-label="Add a photo: choose a file or drop an image"
+                >
+                  <span className="sr-only">Add a photo</span>
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className="h-[44%] w-[44%]"
+                    aria-hidden
+                  >
+                    <rect x="3.5" y="3.5" width="17" height="17" rx="2.75" />
+                    <path d="M12 16V7.5M12 7.5 9.25 10.25M12 7.5l2.75 2.75" />
+                  </svg>
+                </button>
               )}
 
-              {result && activePreviewUrl && (
-                <div className="relative z-10 flex h-full min-h-0 w-full">
-                  {isPatternReady && result.stitchMap ? (
-                    <>
-                      <StitchMapViewer
-                        stitchMap={result.stitchMap}
-                        palette={result.palette}
-                        previewMode={previewMode}
-                        showOutline={showOutline}
-                        lineThickness={result.metrics?.lineThickness ?? lineThickness}
-                        isolatedPaletteId={isolatedPaletteId}
-                        onPaletteSelect={togglePaletteIsolation}
-                      />
-                      {processing && (
-                        <div className="pointer-events-none absolute right-4 top-4 z-20 rounded-full border border-white/10 bg-black/70 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.22em] text-[var(--text-soft)] shadow-[0_12px_30px_rgba(0,0,0,0.24)] backdrop-blur">
-                          {currentStageLabel}
-                        </div>
-                      )}
-                    </>
+              {result && (processing || activePreviewUrl) && (
+                <div className="relative z-10 flex h-full min-h-0 w-full min-w-0 flex-1 flex-col">
+                  {processing ? (
+                    <ProcessingPreview
+                      fileName={result.fileName}
+                      sourceImageUrl={result.sourceImageUrl}
+                      progress={processingProgress}
+                      stages={PROCESSING_STAGES}
+                      isRegeneration={Boolean(result.stitchMap)}
+                    />
+                  ) : isPatternReady && result.stitchMap ? (
+                    <StitchMapViewer
+                      stitchMap={result.stitchMap}
+                      palette={result.palette}
+                      previewMode={previewMode}
+                      showOutline={showOutline}
+                      lineThickness={result.metrics?.lineThickness ?? lineThickness}
+                      isolatedPaletteId={isolatedPaletteId}
+                      onPaletteSelect={togglePaletteIsolation}
+                    />
                   ) : (
-                    <>
-                      {processing ? (
-                        <ProcessingPreview
-                          fileName={result.fileName}
-                          sourceImageUrl={result.sourceImageUrl}
-                          progress={processingProgress}
-                          stages={PROCESSING_STAGES}
-                        />
-                      ) : (
-                        <div className="flex h-full w-full items-center justify-center rounded-[2rem] border border-white/10 bg-[#120d16]/88 p-4 shadow-[0_30px_80px_rgba(10,6,16,0.36)]">
-                          <img
-                            src={activePreviewUrl}
-                            alt="Selected source image"
-                            className="max-h-full max-w-full rounded-[1.4rem] object-contain shadow-[0_18px_50px_rgba(0,0,0,0.28)]"
-                            onLoad={(event) => {
-                              updateImageDimensions(
-                                event.currentTarget.naturalWidth,
-                                event.currentTarget.naturalHeight,
-                              )
-                            }}
-                            onError={() => {
-                              setError('That preview did not load cleanly.')
-                            }}
-                          />
-                        </div>
-                      )}
-                    </>
+                    <div className="flex h-full w-full items-center justify-center rounded-[2rem] border border-white/10 bg-[#120d16]/88 p-4 shadow-[0_30px_80px_rgba(10,6,16,0.36)]">
+                      <img
+                        src={activePreviewUrl ?? result.sourceImageUrl}
+                        alt="Selected source image"
+                        className="max-h-full max-w-full rounded-[1.4rem] object-contain shadow-[0_18px_50px_rgba(0,0,0,0.28)]"
+                        onLoad={(event) => {
+                          updateImageDimensions(
+                            event.currentTarget.naturalWidth,
+                            event.currentTarget.naturalHeight,
+                          )
+                        }}
+                        onError={() => {
+                          setError('That preview did not load cleanly.')
+                        }}
+                      />
+                    </div>
                   )}
                 </div>
               )}
@@ -704,7 +795,7 @@ function App() {
                   <p className="text-[var(--text-muted)]">
                     {result
                       ? `${result.width} x ${result.height}${processing ? ' · processing' : isPatternReady ? ` · ${previewDisplayLabel}` : ''}`
-                      : 'Choose a photo to load it here.'}
+                      : '—'}
                   </p>
                   {result?.metrics && (
                     <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">

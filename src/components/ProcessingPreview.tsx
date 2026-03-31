@@ -5,6 +5,8 @@ interface ProcessingPreviewProps {
   sourceImageUrl: string | null
   progress: ProcessingProgressEvent | null
   stages: ProcessingStageDefinition[]
+  /** True when a pattern already exists and this run refreshes it with new settings. */
+  isRegeneration?: boolean
 }
 
 function clampProgress(value: number) {
@@ -16,14 +18,22 @@ export function ProcessingPreview({
   sourceImageUrl,
   progress,
   stages,
+  isRegeneration = false,
 }: ProcessingPreviewProps) {
   const currentStageIndex = progress ? Math.max(progress.stageIndex - 1, 0) : 0
   const totalStages = progress?.totalStages ?? stages.length
   const activeLabel = progress?.label ?? 'Starting'
-  const progressWidth = `${clampProgress(progress?.progress ?? 0) * 100}%`
+  const pct = clampProgress(progress?.progress ?? 0)
+  const progressWidth = `${pct * 100}%`
+  const indeterminate = pct < 0.035
+
+  const title = isRegeneration ? 'Refreshing your masterpiece.' : 'Your pattern is taking shape.'
+  const subtitle = isRegeneration
+    ? 'New threads, new grid — hang tight while the heavy pass runs.'
+    : 'Color, DMC matches, and stitch outlines are coming together.'
 
   return (
-    <div className="relative z-10 flex h-full w-full overflow-hidden rounded-[2rem] border border-white/10 bg-[#0d0911]/92 shadow-[0_30px_80px_rgba(10,6,16,0.42)]">
+    <div className="magpie-processing-root relative z-10 flex h-full w-full overflow-hidden rounded-[2rem] border border-white/10 bg-[#0d0911]/92 shadow-[0_30px_80px_rgba(10,6,16,0.42)]">
       {sourceImageUrl && (
         <>
           <img
@@ -39,17 +49,15 @@ export function ProcessingPreview({
       <div className="relative flex h-full min-h-0 w-full min-w-0 flex-col justify-between gap-6 overflow-y-auto px-4 py-5 sm:gap-8 sm:px-8 sm:py-8 lg:px-10 lg:py-9">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <p className="magpie-label text-[var(--accent-soft)]">Processing</p>
+            <p className="magpie-label text-[var(--accent-soft)]">Magpie in process</p>
             <h2 className="magpie-display mt-4 text-3xl font-semibold text-[var(--text-strong)] sm:text-[2.2rem]">
-              Building the pattern.
+              {title}
             </h2>
-            <p className="mt-4 max-w-xl text-sm leading-7 text-[var(--text-soft)]">
-              The viewer will appear when the pattern data is ready.
-            </p>
+            <p className="mt-4 max-w-xl text-sm leading-7 text-[var(--text-soft)]">{subtitle}</p>
           </div>
           <div
             aria-hidden="true"
-            className="magpie-processing-spinner mt-1 hidden h-14 w-14 shrink-0 rounded-full border border-white/10 bg-white/[0.04] sm:flex"
+            className="magpie-processing-spinner mt-1 h-14 w-14 shrink-0 rounded-full border border-white/10 bg-white/[0.04]"
           />
         </div>
 
@@ -73,12 +81,28 @@ export function ProcessingPreview({
                 </div>
               </div>
 
-              <div className="mt-4 h-2.5 overflow-hidden rounded-full bg-white/[0.08]">
-                <div className="magpie-processing-bar h-full rounded-full" style={{ width: progressWidth }} />
+              <div
+                className={`relative mt-4 h-2.5 overflow-hidden rounded-full bg-white/[0.08] ${
+                  indeterminate ? 'magpie-processing-bar-track--indeterminate' : ''
+                }`}
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={indeterminate ? undefined : Math.round(pct * 100)}
+                aria-valuetext={indeterminate ? 'Starting' : `${Math.round(pct * 100)}% complete`}
+              >
+                <div
+                  className={`magpie-processing-bar relative h-full rounded-full ${
+                    indeterminate ? 'magpie-processing-bar--indeterminate' : ''
+                  }`}
+                  style={indeterminate ? undefined : { width: progressWidth }}
+                />
               </div>
 
               <p className="mt-3 text-xs leading-6 text-[var(--text-muted)]">
-                Progress tracks completed processing stages.
+                {indeterminate
+                  ? 'Warming up — the bar will track each step as soon as the engine reports in.'
+                  : 'Overall progress across color reduction, thread matching, and outlines.'}
               </p>
             </div>
 
@@ -122,7 +146,8 @@ export function ProcessingPreview({
             <p className="magpie-label">Source</p>
             <p className="mt-3 truncate text-sm text-[var(--text-strong)]">{fileName}</p>
             <p className="mt-2 text-sm leading-6 text-[var(--text-soft)]">
-              The heavy pass is running. Border thickness stays responsive on the canvas.
+              This is the fun part — each cell is being matched to real floss. The interactive viewer
+              pops in when the pass finishes.
             </p>
           </div>
         </div>
