@@ -1,0 +1,115 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    font-family: "Avenir Next", "Segoe UI", sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: #050505;
+    color: #f5f5f4;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background:
+      radial-gradient(circle at top left, rgba(245, 158, 11, 0.14), transparent 24rem),
+      radial-gradient(circle at top right, rgba(56, 189, 248, 0.09), transparent 18rem),
+      linear-gradient(180deg, #111111 0%, #09090b 58%, #050505 100%);
+  }
+
+  button,
+  input,
+  a {
+    font: inherit;
+  }
+
+  ::selection {
+    background: rgba(245, 158, 11, 0.9);
+    color: #111827;
+  }
+}
+
+@layer components {
+  .magpie-panel {
+    @apply rounded-[1.75rem] border border-white/10 bg-white/[0.04] shadow-[0_28px_100px_rgba(0,0,0,0.45)] backdrop-blur-sm;
+  }
+
+  .magpie-label {
+    @apply font-mono text-[11px] uppercase tracking-[0.24em] text-stone-400;
+  }
+
+  .magpie-button {
+    @apply inline-flex items-center justify-center rounded-full border px-4 py-2.5 font-mono text-[11px] uppercase tracking-[0.22em] transition duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300/80 focus-visible:ring-offset-2 focus-visible:ring-offset-black disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .magpie-toggle-segment {
+    @apply inline-flex items-center justify-center rounded-full px-3 py-2 font-mono text-[10px] uppercase tracking-[0.2em] transition duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300/80 focus-visible:ring-offset-2 focus-visible:ring-offset-black;
+  }
+
+  .magpie-range {
+    @apply w-full appearance-none bg-transparent;
+  }
+}
+
+.magpie-range::-webkit-slider-runnable-track {
+  height: 0.45rem;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.88), rgba(255, 255, 255, 0.28));
+}
+
+.magpie-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  margin-top: -0.33rem;
+  height: 1.1rem;
+  width: 1.1rem;
+  border-radius: 9999px;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  background: #09090b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+}
+
+.magpie-range::-moz-range-track {
+  height: 0.45rem;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.88), rgba(255, 255, 255, 0.28));
+}
+
+.magpie-range::-moz-range-thumb {
+  height: 1.1rem;
+  width: 1.1rem;
+  border-radius: 9999px;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  background: #09090b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+}
+
+::-webkit-scrollbar {
+  width: 0.7rem;
+  height: 0.7rem;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background: rgba(255, 255, 255, 0.18);
+  background-clip: padding-box;
+}

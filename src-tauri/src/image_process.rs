@@ -1,0 +1,587 @@
+use image::{GenericImageView, GrayImage, Rgba, RgbaImage};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DMCColor {
+    pub number: String,
+    pub name: String,
+    pub rgb: DMCRgb,
+    pub hex: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DMCRgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaletteEntry {
+    pub pal_id: u8,
+    pub dmc_number: String,
+    pub dmc_name: String,
+    pub dmc_hex: String,
+    pub centroid_r: u8,
+    pub centroid_g: u8,
+    pub centroid_b: u8,
+    pub region_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ColoringBookResult {
+    pub image_data: Vec<u8>,          // PNG bytes
+    pub thread_preview_data: Vec<u8>, // PNG bytes
+    pub palette: Vec<PaletteEntry>,
+}
+
+// Load DMC data at compile time.
+const DMC_JSON: &str = include_str!("../data/dmc-floss.json");
+
+fn parse_dmc() -> Vec<DMCColor> {
+    serde_json::from_str(DMC_JSON).expect("failed to parse DMC JSON")
+}
+
+// --- Color science ---
+
+fn rgb_to_lab(r: u8, g: u8, b: u8) -> [f64; 3] {
+    let rlin = srgb_to_linear(r as f64 / 255.0);
+    let glin = srgb_to_linear(g as f64 / 255.0);
+    let blin = srgb_to_linear(b as f64 / 255.0);
+
+    // sRGB to XYZ (D65)
+    let x = rlin * 0.4124564 + glin * 0.3575761 + blin * 0.1804375;
+    let y = rlin * 0.2126729 + glin * 0.7151522 + blin * 0.0721750;
+    let z = rlin * 0.0193339 + glin * 0.1191920 + blin * 0.9503041;
+
+    // XYZ to Lab (D65 reference)
+    let fx = lab_f(x / 0.95047);
+    let fy = lab_f(y / 1.00000);
+    let fz = lab_f(z / 1.08883);
+
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn srgb_to_linear(c: f64) -> f64 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn lab_f(t: f64) -> f64 {
+    if t > 0.008856 {
+        t.powf(1.0 / 3.0)
+    } else {
+        7.787 * t + 16.0 / 116.0
+    }
+}
+
+fn delta_e(lab1: [f64; 3], lab2: [f64; 3]) -> f64 {
+    ((lab1[0] - lab2[0]).powi(2) + (lab1[1] - lab2[1]).powi(2) + (lab1[2] - lab2[2]).powi(2)).sqrt()
+}
+
+// --- K-means quantization ---
+
+fn kmeans_quantize(
+    pixels: &[(u8, u8, u8)],
+    k: usize,
+    iterations: usize,
+) -> (Vec<(u8, u8, u8)>, Vec<u8>) {
+    let n = pixels.len();
+    if k < 1 || n == 0 {
+        return (vec![], vec![]);
+    }
+
+    let mut rng = SimpleRng::from_seed(42);
+
+    // Initialize centroids from random pixels
+    let mut centroids: Vec<(u8, u8, u8)> = Vec::with_capacity(k);
+    for _ in 0..k {
+        centroids.push(pixels[rng.next() % n]);
+    }
+
+    let mut labels = vec![0u8; n];
+
+    for _iter in 0..iterations {
+        // Assign step
+        for (i, &px) in pixels.iter().enumerate() {
+            let mut best_label = 0u8;
+            let mut best_dist = f64::MAX;
+            for (l, c) in centroids.iter().enumerate() {
+                let d = rgb_dist(px, *c);
+                if d < best_dist {
+                    best_dist = d;
+                    best_label = l as u8;
+                }
+            }
+            labels[i] = best_label;
+        }
+
+        // Update step
+        let mut sums = vec![(0.0f64, 0.0f64, 0.0f64, 0usize); k];
+        for (i, &px) in pixels.iter().enumerate() {
+            let l = labels[i] as usize;
+            if l < k {
+                sums[l].0 += px.0 as f64;
+                sums[l].1 += px.1 as f64;
+                sums[l].2 += px.2 as f64;
+                sums[l].3 += 1;
+            }
+        }
+        for (l, c) in centroids.iter_mut().enumerate() {
+            if sums[l].3 > 0 {
+                *c = (
+                    (sums[l].0 / sums[l].3 as f64).round() as u8,
+                    (sums[l].1 / sums[l].3 as f64).round() as u8,
+                    (sums[l].2 / sums[l].3 as f64).round() as u8,
+                );
+            }
+        }
+    }
+
+    (centroids, labels)
+}
+
+fn rgb_dist(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let dr = a.0 as f64 - b.0 as f64;
+    let dg = a.1 as f64 - b.1 as f64;
+    let db = a.2 as f64 - b.2 as f64;
+    (dr * dr + dg * dg + db * db).sqrt()
+}
+
+struct SimpleRng(u64);
+
+impl SimpleRng {
+    fn from_seed(s: u64) -> Self {
+        Self(s | 1)
+    }
+    fn next(&mut self) -> usize {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0 = self.0.wrapping_mul(0x2545F4914F6CDD1D);
+        self.0 as usize
+    }
+}
+
+// --- Map centroids -> DMC ---
+
+fn map_to_dmc(centroids: &[(u8, u8, u8)]) -> Vec<PaletteEntry> {
+    let dmc = parse_dmc();
+    let dmc_lab: Vec<[f64; 3]> = dmc
+        .iter()
+        .map(|c| rgb_to_lab(c.rgb.r, c.rgb.g, c.rgb.b))
+        .collect();
+
+    centroids
+        .iter()
+        .enumerate()
+        .map(|(idx, &c)| {
+            let cl = rgb_to_lab(c.0, c.1, c.2);
+            let mut best_idx = 0usize;
+            let mut best_dist = f64::MAX;
+            for (i, &lab) in dmc_lab.iter().enumerate() {
+                let d = delta_e(cl, lab);
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = i;
+                }
+            }
+            let best = &dmc[best_idx];
+            PaletteEntry {
+                pal_id: idx as u8,
+                dmc_number: best.number.clone(),
+                dmc_name: best.name.clone(),
+                dmc_hex: best.hex.clone(),
+                centroid_r: c.0,
+                centroid_g: c.1,
+                centroid_b: c.2,
+                region_count: 0, // computed downstream
+            }
+        })
+        .collect()
+}
+
+fn parse_hex_rgb(hex: &str) -> Option<(u8, u8, u8)> {
+    let hex = hex.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+
+    Some((r, g, b))
+}
+
+// --- Flood-fill connected regions, merge small regions into neighbors ---
+
+fn flood_fill(
+    width: u32,
+    height: u32,
+    labels: &[u8],
+    min_region_size: usize,
+) -> Result<Vec<u8>, String> {
+    let n = (width * height) as usize;
+    if labels.len() != n {
+        return Err(format!(
+            "Label buffer length {} does not match image size {}",
+            labels.len(),
+            n
+        ));
+    }
+
+    let mut visited = vec![false; n];
+    let mut region_id = vec![usize::MAX; n];
+    let mut region_sizes: Vec<usize> = Vec::new();
+    let mut regions: Vec<Vec<usize>> = Vec::new();
+    let mut merge_map: Vec<u8> = Vec::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y * width + x) as usize;
+            if visited[idx] {
+                continue;
+            }
+
+            let label = labels[idx];
+            let mut stack = vec![(x, y)];
+            let mut pixels: Vec<usize> = Vec::new();
+
+            visited[idx] = true;
+            while let Some((cx, cy)) = stack.pop() {
+                let ci = (cy * width + cx) as usize;
+                pixels.push(ci);
+
+                for (nx, ny) in [
+                    (cx.wrapping_sub(1), cy),
+                    (cx + 1, cy),
+                    (cx, cy.wrapping_sub(1)),
+                    (cx, cy + 1),
+                ] {
+                    if nx < width && ny < height {
+                        let ni = (ny * width + nx) as usize;
+                        if visited[ni] {
+                            continue;
+                        }
+                        if labels[ni] == label {
+                            visited[ni] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+            }
+
+            let rid = region_sizes.len();
+            for &pi in &pixels {
+                region_id[pi] = rid;
+            }
+            region_sizes.push(pixels.len());
+            regions.push(pixels);
+            merge_map.push(label);
+        }
+    }
+
+    let mut final_labels = labels.to_vec();
+    let num_regions = region_sizes.len();
+
+    for rid in 0..num_regions {
+        if region_sizes[rid] >= min_region_size {
+            continue;
+        }
+
+        let mut neighbor_votes: Vec<usize> = vec![0; num_regions];
+        for &pi in &regions[rid] {
+            let x = (pi as u32) % width;
+            let y = (pi as u32) / width;
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if nx < width && ny < height {
+                    let ni = (ny * width + nx) as usize;
+                    let nr = region_id[ni];
+                    if nr != usize::MAX && nr < num_regions && nr != rid {
+                        neighbor_votes[nr] += 1;
+                    }
+                }
+            }
+        }
+
+        let Some((best_neighbor, best_votes)) = neighbor_votes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| *i != rid)
+            .max_by_key(|(_, votes)| *votes)
+        else {
+            continue;
+        };
+
+        if best_votes == 0 {
+            continue;
+        }
+
+        let merged_label = merge_map[best_neighbor];
+        merge_map[rid] = merged_label;
+
+        for &pi in &regions[rid] {
+            final_labels[pi] = merged_label;
+        }
+    }
+
+    Ok(final_labels)
+}
+
+// --- Render coloring-book outline: black lines on white ---
+
+fn draw_region_boundaries<F>(
+    width: u32,
+    height: u32,
+    labels: &[u8],
+    line_thickness: u32,
+    mut paint: F,
+) where
+    F: FnMut(u32, u32),
+{
+    for y in 0..height {
+        for x in 0..width {
+            let base = (y * width + x) as usize;
+            let label = labels[base];
+
+            // Check right neighbor
+            if x + 1 < width && labels[base + 1] != label {
+                for dx in 0..line_thickness {
+                    let px = x + dx;
+                    if px < width {
+                        paint(px, y);
+                    }
+                }
+            }
+            // Check bottom neighbor
+            if y + 1 < height && labels[base + width as usize] != label {
+                for dy in 0..line_thickness {
+                    let py = y + dy;
+                    if py < height {
+                        paint(x, py);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_coloring_book(width: u32, height: u32, labels: &[u8], line_thickness: u32) -> GrayImage {
+    let mut out = GrayImage::from_pixel(width, height, image::Luma([255u8]));
+
+    draw_region_boundaries(width, height, labels, line_thickness, |x, y| {
+        *out.get_pixel_mut(x, y) = image::Luma([0u8]);
+    });
+
+    out
+}
+
+fn render_thread_preview(
+    width: u32,
+    height: u32,
+    labels: &[u8],
+    palette: &[PaletteEntry],
+    line_thickness: u32,
+) -> RgbaImage {
+    let palette_colors: Vec<(u8, u8, u8)> = palette
+        .iter()
+        .map(|entry| {
+            parse_hex_rgb(&entry.dmc_hex).unwrap_or((
+                entry.centroid_r,
+                entry.centroid_g,
+                entry.centroid_b,
+            ))
+        })
+        .collect();
+
+    let mut out = RgbaImage::from_fn(width, height, |x, y| {
+        let idx = (y * width + x) as usize;
+        let label = labels.get(idx).copied().unwrap_or_default() as usize;
+        let (r, g, b) = palette_colors
+            .get(label)
+            .copied()
+            .unwrap_or((255, 255, 255));
+        Rgba([r, g, b, 255])
+    });
+
+    draw_region_boundaries(width, height, labels, line_thickness, |x, y| {
+        *out.get_pixel_mut(x, y) = Rgba([0, 0, 0, 255]);
+    });
+
+    out
+}
+
+/// Tauri command: load image -> quantize -> outline -> return PNG + DMC palette
+#[tauri::command]
+pub fn process_image(
+    image_path: String,
+    num_colors: u8,
+    line_thickness: u32,
+    downscale_max: u32,
+    min_region_size: usize,
+) -> Result<ColoringBookResult, String> {
+    // 1. Load image
+    let img = image::open(&image_path).map_err(|e| format!("Failed to load image: {}", e))?;
+
+    // 2. Scale down if needed for performance
+    let (ow, oh) = img.dimensions();
+    let max_dim = downscale_max.max(200);
+    let (w, h) = if ow > max_dim || oh > max_dim {
+        let s = max_dim as f64 / (ow.max(oh) as f64);
+        (
+            (ow as f64 * s).round() as u32,
+            (oh as f64 * s).round() as u32,
+        )
+    } else {
+        (ow, oh)
+    };
+    let img = img.resize_exact(w, h, image::imageops::Lanczos3);
+    let rgb = img.to_rgb8();
+
+    // 3. Flatten pixels
+    let pixels: Vec<(u8, u8, u8)> = rgb.pixels().map(|p| (p[0], p[1], p[2])).collect();
+
+    // 4. K-means quantize
+    let k = num_colors as usize;
+    let (centroids, labels) = kmeans_quantize(&pixels, k, 20);
+
+    if centroids.is_empty() {
+        return Err("Quantization produced no centroids".to_string());
+    }
+
+    // 5. Flood-fill regions, merge small ones
+    let merged_labels = flood_fill(w, h, &labels, min_region_size)?;
+
+    // 6. Compute palette + region counts
+    let mut palette = map_to_dmc(&centroids);
+    // Recount regions in merged labels
+    let mut counts = vec![0usize; centroids.len()];
+    for &lab in &merged_labels {
+        if (lab as usize) < counts.len() {
+            counts[lab as usize] += 1;
+        }
+    }
+    for pe in &mut palette {
+        pe.region_count = counts[pe.pal_id as usize];
+    }
+
+    // 7. Render both previews from the merged label map
+    let coloring_book = render_coloring_book(w, h, &merged_labels, line_thickness);
+    let thread_preview = render_thread_preview(w, h, &merged_labels, &palette, line_thickness);
+
+    // 8. Encode to PNG
+    let mut png_bytes = Vec::new();
+    coloring_book
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("PNG encode failed: {}", e))?;
+
+    let mut thread_preview_bytes = Vec::new();
+    thread_preview
+        .write_to(
+            &mut std::io::Cursor::new(&mut thread_preview_bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("Thread preview PNG encode failed: {}", e))?;
+
+    Ok(ColoringBookResult {
+        image_data: png_bytes,
+        thread_preview_data: thread_preview_bytes,
+        palette,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flood_fill, render_thread_preview, PaletteEntry};
+
+    #[test]
+    fn flood_fill_should_merge_small_region_into_neighbor() {
+        let labels = vec![1, 1, 2];
+
+        let merged = flood_fill(3, 1, &labels, 2).expect("flood fill should succeed");
+
+        assert_eq!(merged, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn flood_fill_should_accept_more_than_255_regions() {
+        let width = 32;
+        let height = 32;
+        let labels: Vec<u8> = (0..(width * height))
+            .map(|idx| if idx % 2 == 0 { 0 } else { 1 })
+            .collect();
+
+        let merged = flood_fill(width, height, &labels, 2).expect("flood fill should succeed");
+
+        assert_eq!(merged.len(), labels.len());
+    }
+
+    #[test]
+    fn flood_fill_should_return_error_for_mismatched_label_buffer() {
+        let err = flood_fill(2, 2, &[0, 1, 2], 1).expect_err("buffer mismatch should fail");
+
+        assert!(err.contains("Label buffer length"));
+    }
+
+    #[test]
+    fn thread_preview_should_fill_regions_with_dmc_hex_color() {
+        let palette = vec![PaletteEntry {
+            pal_id: 0,
+            dmc_number: "321".into(),
+            dmc_name: "Red".into(),
+            dmc_hex: "#C53333".into(),
+            centroid_r: 0,
+            centroid_g: 0,
+            centroid_b: 0,
+            region_count: 1,
+        }];
+
+        let preview = render_thread_preview(1, 1, &[0], &palette, 1);
+
+        assert_eq!(preview.get_pixel(0, 0).0, [0xC5, 0x33, 0x33, 255]);
+    }
+
+    #[test]
+    fn thread_preview_should_keep_outline_on_region_boundaries() {
+        let palette = vec![
+            PaletteEntry {
+                pal_id: 0,
+                dmc_number: "321".into(),
+                dmc_name: "Red".into(),
+                dmc_hex: "#C53333".into(),
+                centroid_r: 0,
+                centroid_g: 0,
+                centroid_b: 0,
+                region_count: 1,
+            },
+            PaletteEntry {
+                pal_id: 1,
+                dmc_number: "996".into(),
+                dmc_name: "Blue".into(),
+                dmc_hex: "#30D5FF".into(),
+                centroid_r: 0,
+                centroid_g: 0,
+                centroid_b: 0,
+                region_count: 1,
+            },
+        ];
+
+        let preview = render_thread_preview(2, 1, &[0, 1], &palette, 1);
+
+        assert_eq!(preview.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(preview.get_pixel(1, 0).0, [0x30, 0xD5, 0xFF, 255]);
+    }
+}
